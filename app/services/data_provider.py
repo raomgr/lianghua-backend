@@ -266,7 +266,9 @@ class TushareProvider(BaseProvider):
     def _get_basic_universe(self) -> list[UniverseItem]:
         if self.custom_universe:
             return self.custom_universe[: self.settings.universe_limit]
-        return []
+        # Keep a low-permission compatible default universe so Tushare users can
+        # still sync/train before building a custom pool in the UI.
+        return get_common_universe_catalog()[: self.settings.universe_limit]
 
     def get_universe(self) -> list[UniverseItem]:
         return self._get_basic_universe()

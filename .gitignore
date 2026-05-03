@@ -4,9 +4,6 @@ Thumbs.db
 .idea/
 .vscode/
 
-.env
-.env.local
-.env.*.local
 .venv/
 venv/
 .python-version

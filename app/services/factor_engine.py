@@ -108,6 +108,31 @@ def build_factor_table(provider: BaseProvider) -> pd.DataFrame:
 
 
 def build_factor_table_from_histories(histories: dict[str, pd.DataFrame], names: dict[str, str] | None = None) -> pd.DataFrame:
+    output_columns = [
+        "symbol",
+        "name",
+        "close",
+        "ret_1d",
+        "return_5d",
+        "return_10d",
+        "momentum_20",
+        "momentum_60",
+        "reversal_10",
+        "volatility_10",
+        "volatility_20",
+        "volatility_60",
+        "volume_ratio_5",
+        "volume_ratio_20",
+        "turnover_rate",
+        "turnover_ratio_5",
+        "price_vs_ma_20",
+        "price_vs_ma_60",
+        "breakout_20",
+        "close_position_20",
+        "intraday_range",
+        "atr_14",
+        "score",
+    ]
     rows = []
     for symbol, bars in histories.items():
         if bars.empty or len(bars) < 25:
@@ -139,36 +164,11 @@ def build_factor_table_from_histories(histories: dict[str, pd.DataFrame], names:
                 "close_position_20": float(latest["close_position_20"]),
                 "intraday_range": float(latest["intraday_range"]),
                 "atr_14": float(latest["atr_14"]),
+                "score": 0.0,
             }
         )
 
-    frame = pd.DataFrame(
-        rows,
-        columns=[
-            "symbol",
-            "name",
-            "close",
-            "ret_1d",
-            "return_5d",
-            "return_10d",
-            "momentum_20",
-            "momentum_60",
-            "reversal_10",
-            "volatility_10",
-            "volatility_20",
-            "volatility_60",
-            "volume_ratio_5",
-            "volume_ratio_20",
-            "turnover_rate",
-            "turnover_ratio_5",
-            "price_vs_ma_20",
-            "price_vs_ma_60",
-            "breakout_20",
-            "close_position_20",
-            "intraday_range",
-            "atr_14",
-        ],
-    )
+    frame = pd.DataFrame(rows, columns=output_columns)
     if frame.empty:
         return frame
     return score_factors(frame)

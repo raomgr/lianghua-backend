@@ -22,7 +22,10 @@ class Settings(BaseSettings):
     fallback_to_mock_on_data_error: bool = True
 
     model_config = SettingsConfigDict(
-        env_file=str(BACKEND_DIR / ".env"),
+        env_file=(
+            str(BACKEND_DIR / ".env"),
+            str(BACKEND_DIR / ".env.local"),
+        ),
         env_file_encoding="utf-8",
         case_sensitive=False,
     )
