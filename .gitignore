@@ -28,7 +28,7 @@ coverage.xml
 
 .env.local
 
-data/
+/data/
 *.db
 *.sqlite
 *.sqlite3
