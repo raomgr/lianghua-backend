@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -40,6 +40,14 @@ MODEL_SPECS: list[dict[str, Any]] = [
         "note": "Tree benchmark trained on daily bar factors.",
     },
 ]
+
+
+ProgressCallback = Callable[[str], None]
+
+
+def _emit_progress(callback: ProgressCallback | None, message: str) -> None:
+    if callback:
+        callback(message)
 
 
 def _compute_directional_accuracy(predicted: np.ndarray, actual: np.ndarray) -> float:
@@ -155,7 +163,12 @@ def _build_model_metrics(
     return {**metadata, **walk_forward_metrics}
 
 
-def _run_walk_forward_validation(dataset: pd.DataFrame, spec: dict[str, Any]) -> dict[str, Any]:
+def _run_walk_forward_validation(
+    dataset: pd.DataFrame,
+    spec: dict[str, Any],
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
     unique_dates = sorted(dataset["trade_date"].unique())
     if len(unique_dates) < 12:
         return {
@@ -174,8 +187,9 @@ def _run_walk_forward_validation(dataset: pd.DataFrame, spec: dict[str, Any]) ->
     ic_values: list[float] = []
     acc_values: list[float] = []
     long_short_values: list[float] = []
+    total_windows = len(eval_dates)
 
-    for current_date in eval_dates:
+    for index, current_date in enumerate(eval_dates, start=1):
         train_df = dataset[dataset["trade_date"] < current_date].copy()
         eval_df = dataset[dataset["trade_date"] == current_date].copy()
         if train_df.empty or eval_df.empty or len(eval_df) < 2:
@@ -195,6 +209,13 @@ def _run_walk_forward_validation(dataset: pd.DataFrame, spec: dict[str, Any]) ->
         bottom_actual = actual[order[:bucket_size]]
         top_actual = actual[order[-bucket_size:]]
         long_short_values.append(float(np.mean(top_actual) - np.mean(bottom_actual)))
+
+        if index == 1 or index == total_windows or index % 10 == 0:
+            _emit_progress(
+                progress_callback,
+                f"[{spec['name']}] walk-forward {index}/{total_windows} "
+                f"({current_date})",
+            )
 
     if not ic_values:
         return {
@@ -255,14 +276,25 @@ def train_local_models(
     *,
     provider_name: str | None = None,
     configured_provider: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     dataset = build_training_dataset_from_histories(histories, names=names)
     if dataset.empty or len(dataset) < 30:
         raise RuntimeError("Not enough historical rows to train a local model.")
 
+    _emit_progress(
+        progress_callback,
+        f"training dataset ready: rows={len(dataset)} symbols={dataset['symbol'].nunique()}",
+    )
+
     train_df, valid_df = _split_dataset(dataset)
     if train_df.empty or valid_df.empty:
         raise RuntimeError("Not enough train/validation rows after dataset split.")
+
+    _emit_progress(
+        progress_callback,
+        f"dataset split complete: train_rows={len(train_df)} validation_rows={len(valid_df)}",
+    )
 
     latest_factor_table = build_factor_table_from_histories(histories, names=names)
     if latest_factor_table.empty:
@@ -271,14 +303,22 @@ def train_local_models(
 
     evaluated_results: list[dict[str, Any]] = []
     for spec in MODEL_SPECS:
+        _emit_progress(progress_callback, f"start fitting model: {spec['name']}")
         model = _fit_model(train_df, spec)
+        _emit_progress(progress_callback, f"fitted model: {spec['name']}")
         valid_pred = _predict(valid_df, model)
         valid_actual = valid_df["future_return_5d"].to_numpy(dtype=float)
 
         validation_ic = _compute_ic(valid_pred, valid_actual)
         validation_directional_accuracy = _compute_directional_accuracy(valid_pred, valid_actual)
         validation_mse = float(np.mean((valid_pred - valid_actual) ** 2))
-        walk_forward_metrics = _run_walk_forward_validation(dataset, spec)
+        _emit_progress(progress_callback, f"start walk-forward validation: {spec['name']}")
+        walk_forward_metrics = _run_walk_forward_validation(
+            dataset,
+            spec,
+            progress_callback=progress_callback,
+        )
+        _emit_progress(progress_callback, f"finished walk-forward validation: {spec['name']}")
         selection_score = float(walk_forward_metrics.get("walk_forward_mean_ic", 0.0) or validation_ic)
 
         evaluated_results.append(
@@ -304,6 +344,7 @@ def train_local_models(
 
     ranked_results = sorted(evaluated_results, key=_selection_key, reverse=True)
     champion_name = ranked_results[0]["model_name"]
+    _emit_progress(progress_callback, f"champion selected: {champion_name}")
 
     settings = get_settings()
     repo = MarketRepository()
@@ -382,10 +423,12 @@ def train_local_model(
     *,
     provider_name: str | None = None,
     configured_provider: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     return train_local_models(
         histories,
         names,
         provider_name=provider_name,
         configured_provider=configured_provider,
+        progress_callback=progress_callback,
     )

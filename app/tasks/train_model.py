@@ -1,15 +1,25 @@
+from datetime import datetime
+
 from app.services.market_service import MarketService
 from app.services.training import train_local_model
 
 
+def _print_progress(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
 def main() -> None:
     service = MarketService()
+    _print_progress("loading training inputs")
     histories, names = service.get_training_inputs(limit=220)
+    _print_progress(f"loaded histories: symbols={len(histories)}")
     result = train_local_model(
         histories,
         names,
         provider_name=service.active_data_provider,
         configured_provider=service.settings.data_provider,
+        progress_callback=_print_progress,
     )
     print(result["message"])
     print(
