@@ -173,7 +173,47 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\install_refres
 
 - `http://116.62.21.194:8000/health`
 
-## 11. 当前需要修改、添加、删除的文件
+## 11. 日常更新命令
+
+后端更新后：
+
+```powershell
+cd D:\ashare-quant\app\backend
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\update_backend.ps1
+```
+
+如果这次改了 Python 依赖，带上：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\update_backend.ps1 -InstallDeps
+```
+
+如果这次改了数据/模型逻辑，带上：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\update_backend.ps1 -RunRefresh
+```
+
+前端更新后：
+
+```powershell
+cd D:\ashare-quant\app\backend
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\update_frontend.ps1 -PublishRoot "D:\wwwroot\lianghua-web"
+```
+
+如果这次改了前端依赖，带上：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\update_frontend.ps1 -PublishRoot "D:\wwwroot\lianghua-web" -InstallDeps
+```
+
+只想重启后端服务时：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\restart_backend.ps1
+```
+
+## 12. 当前需要修改、添加、删除的文件
 
 这次按标准上线流程，建议这样整理：
 
@@ -183,7 +223,10 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\install_refres
 - `frontend/.env.production`
 - `deploy/windows/scripts/prepare_backend.ps1`
 - `deploy/windows/scripts/start_backend.ps1`
+- `deploy/windows/scripts/restart_backend.ps1`
 - `deploy/windows/scripts/install_backend_task.ps1`
+- `deploy/windows/scripts/update_backend.ps1`
+- `deploy/windows/scripts/update_frontend.ps1`
 - `deploy/windows/scripts/run_refresh.ps1`
 - `deploy/windows/scripts/install_refresh_task.ps1`
 - `deploy/windows/scripts/build_frontend.ps1`
@@ -195,7 +238,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\scripts\install_refres
 - 不再用 `vite preview` 作为正式前端服务
 - 不再让后端启动脚本每次都重新安装依赖
 
-## 12. 后续再补的生产项
+## 13. 后续再补的生产项
 
 后面可以继续加：
 
