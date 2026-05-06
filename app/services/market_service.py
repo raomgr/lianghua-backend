@@ -401,8 +401,54 @@ class MarketService:
             "model_run_id": int(latest_run["id"]),
             "status": "pending",
             "note": "",
+            "execution_items": [],
+            "execution_summary": {},
             "updated_at": "",
         }
+
+        existing_execution_map = {
+            str(item.get("symbol", "")).zfill(6): item
+            for item in review.get("execution_items", [])
+            if item.get("symbol")
+        }
+        merged_execution_items = []
+        for item in suggestions:
+            if item["action"] == "持有":
+                continue
+            existing = existing_execution_map.get(str(item["symbol"]))
+            merged_execution_items.append(
+                {
+                    "symbol": str(item["symbol"]),
+                    "name": str(item["name"]),
+                    "action": str(item["action"]),
+                    "planned_quantity": abs(int(item["delta_quantity"])) if item["action"] in {"卖出", "减仓"} else int(item["target_quantity"]),
+                    "executed_quantity": int(existing.get("executed_quantity", 0)) if existing else 0,
+                    "executed_price": float(existing.get("executed_price", 0.0)) if existing else 0.0,
+                    "note": str(existing.get("note", "")) if existing else "",
+                }
+            )
+        if merged_execution_items:
+            review["execution_items"] = merged_execution_items
+            review["execution_summary"] = {
+                "items_count": len(merged_execution_items),
+                "executed_items_count": sum(1 for item in merged_execution_items if item["executed_quantity"] > 0),
+                "executed_buy_amount": round(
+                    sum(
+                        item["executed_quantity"] * item["executed_price"]
+                        for item in merged_execution_items
+                        if item["action"] in {"买入", "加仓"}
+                    ),
+                    2,
+                ),
+                "executed_sell_amount": round(
+                    sum(
+                        item["executed_quantity"] * item["executed_price"]
+                        for item in merged_execution_items
+                        if item["action"] in {"卖出", "减仓"}
+                    ),
+                    2,
+                ),
+            }
 
         warnings: list[str] = []
         if status.get("active_data_provider") != status.get("provider"):
@@ -451,8 +497,19 @@ class MarketService:
         active_provider = resolve_active_provider(self.repo, self.settings.data_provider)
         return self.repo.load_recent_signal_batches(limit=limit, top_n=5, provider=active_provider)
 
-    def save_signal_review(self, model_run_id: int, status: str, note: str = "") -> dict:
-        return self.repo.save_signal_review(model_run_id=model_run_id, status=status, note=note)
+    def save_signal_review(
+        self,
+        model_run_id: int,
+        status: str,
+        note: str = "",
+        execution_items: list[dict] | None = None,
+    ) -> dict:
+        return self.repo.save_signal_review(
+            model_run_id=model_run_id,
+            status=status,
+            note=note,
+            execution_items=execution_items,
+        )
 
     def get_factor_table(self) -> pd.DataFrame:
         histories = self._load_histories(limit=90)

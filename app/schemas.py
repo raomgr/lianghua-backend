@@ -578,6 +578,18 @@ class SignalReview(BaseModel):
     status: str = "pending"
     note: str = ""
     updated_at: str = ""
+    execution_items: list["SignalExecutionItem"] = Field(default_factory=list)
+    execution_summary: dict = Field(default_factory=dict)
+
+
+class SignalExecutionItem(BaseModel):
+    symbol: str
+    name: str
+    action: str
+    planned_quantity: int = 0
+    executed_quantity: int = 0
+    executed_price: float = 0.0
+    note: str = ""
 
 
 class SignalSuggestion(BaseModel):
@@ -639,12 +651,14 @@ class SignalHistoryItem(BaseModel):
     review_status: str = "pending"
     review_note: str = ""
     review_updated_at: str = ""
+    execution_summary: dict = Field(default_factory=dict)
 
 
 class SignalReviewRequest(BaseModel):
     model_run_id: int
     status: str = "pending"
     note: str = ""
+    execution_items: list[SignalExecutionItem] = Field(default_factory=list)
 
 
 class ModelFeatureImportance(BaseModel):

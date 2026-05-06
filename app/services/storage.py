@@ -282,11 +282,15 @@ class MarketRepository:
                     model_run_id INTEGER PRIMARY KEY,
                     status TEXT NOT NULL,
                     note TEXT NOT NULL,
+                    execution_items_json TEXT NOT NULL DEFAULT '[]',
+                    execution_summary_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(model_run_id) REFERENCES model_runs(id)
                 )
                 """
             )
+            self._ensure_column(conn, "signal_reviews", "execution_items_json", "TEXT NOT NULL DEFAULT '[]'")
+            self._ensure_column(conn, "signal_reviews", "execution_summary_json", "TEXT NOT NULL DEFAULT '{}'")
 
     def _table_primary_key_columns(self, conn: sqlite3.Connection, table_name: str) -> list[str]:
         return [row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall() if int(row[5]) > 0]
@@ -743,27 +747,80 @@ class MarketRepository:
 
         return frame.to_dict(orient="records")
 
-    def save_signal_review(self, model_run_id: int, status: str, note: str = "") -> dict:
+    def save_signal_review(
+        self,
+        model_run_id: int,
+        status: str,
+        note: str = "",
+        execution_items: list[dict] | None = None,
+    ) -> dict:
         updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         normalized_status = str(status or "pending").strip().lower()
         if normalized_status not in {"pending", "executed", "ignored"}:
             normalized_status = "pending"
+        normalized_execution_items = []
+        for item in execution_items or []:
+            symbol = str(item.get("symbol", "")).zfill(6)
+            if not symbol or symbol == "000000":
+                continue
+            normalized_execution_items.append(
+                {
+                    "symbol": symbol,
+                    "name": str(item.get("name", "") or symbol).strip(),
+                    "action": str(item.get("action", "")).strip(),
+                    "planned_quantity": max(int(item.get("planned_quantity", 0) or 0), 0),
+                    "executed_quantity": max(int(item.get("executed_quantity", 0) or 0), 0),
+                    "executed_price": max(float(item.get("executed_price", 0.0) or 0.0), 0.0),
+                    "note": str(item.get("note", "") or "").strip(),
+                }
+            )
+        execution_summary = {
+            "items_count": len(normalized_execution_items),
+            "executed_items_count": sum(1 for item in normalized_execution_items if item["executed_quantity"] > 0),
+            "executed_buy_amount": round(
+                sum(
+                    item["executed_quantity"] * item["executed_price"]
+                    for item in normalized_execution_items
+                    if item["action"] in {"买入", "加仓"}
+                ),
+                2,
+            ),
+            "executed_sell_amount": round(
+                sum(
+                    item["executed_quantity"] * item["executed_price"]
+                    for item in normalized_execution_items
+                    if item["action"] in {"卖出", "减仓"}
+                ),
+                2,
+            ),
+        }
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO signal_reviews(model_run_id, status, note, updated_at)
-                VALUES(?, ?, ?, ?)
+                INSERT INTO signal_reviews(model_run_id, status, note, execution_items_json, execution_summary_json, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
                 ON CONFLICT(model_run_id) DO UPDATE SET
                     status = excluded.status,
                     note = excluded.note,
+                    execution_items_json = excluded.execution_items_json,
+                    execution_summary_json = excluded.execution_summary_json,
                     updated_at = excluded.updated_at
                 """,
-                (int(model_run_id), normalized_status, str(note or "").strip(), updated_at),
+                (
+                    int(model_run_id),
+                    normalized_status,
+                    str(note or "").strip(),
+                    json.dumps(normalized_execution_items, ensure_ascii=False),
+                    json.dumps(execution_summary, ensure_ascii=False),
+                    updated_at,
+                ),
             )
         return {
             "model_run_id": int(model_run_id),
             "status": normalized_status,
             "note": str(note or "").strip(),
+            "execution_items": normalized_execution_items,
+            "execution_summary": execution_summary,
             "updated_at": updated_at,
         }
 
@@ -771,7 +828,7 @@ class MarketRepository:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT model_run_id, status, note, updated_at
+                SELECT model_run_id, status, note, execution_items_json, execution_summary_json, updated_at
                 FROM signal_reviews
                 WHERE model_run_id = ?
                 LIMIT 1
@@ -784,7 +841,9 @@ class MarketRepository:
             "model_run_id": int(row[0]),
             "status": str(row[1]),
             "note": str(row[2]),
-            "updated_at": str(row[3]),
+            "execution_items": json.loads(row[3] or "[]"),
+            "execution_summary": json.loads(row[4] or "{}"),
+            "updated_at": str(row[5]),
         }
 
     def load_signal_reviews(self, model_run_ids: list[int]) -> dict[int, dict]:
@@ -792,7 +851,7 @@ class MarketRepository:
             return {}
         placeholders = ",".join("?" for _ in model_run_ids)
         query = f"""
-        SELECT model_run_id, status, note, updated_at
+        SELECT model_run_id, status, note, execution_items_json, execution_summary_json, updated_at
         FROM signal_reviews
         WHERE model_run_id IN ({placeholders})
         """
@@ -806,6 +865,8 @@ class MarketRepository:
                 "model_run_id": int(row["model_run_id"]),
                 "status": str(row["status"]),
                 "note": str(row["note"]),
+                "execution_items": json.loads(str(row["execution_items_json"] or "[]")),
+                "execution_summary": json.loads(str(row["execution_summary_json"] or "{}")),
                 "updated_at": str(row["updated_at"]),
             }
         return reviews
@@ -893,6 +954,7 @@ class MarketRepository:
                     "review_status": str(review["status"]),
                     "review_note": str(review["note"]),
                     "review_updated_at": str(review["updated_at"]),
+                    "execution_summary": dict(review.get("execution_summary", {})),
                 }
             )
         return rows

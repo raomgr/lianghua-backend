@@ -366,7 +366,14 @@ def signal_history(limit: int = Query(12, ge=3, le=40)) -> list[SignalHistoryIte
 
 @app.post("/api/signals/review", response_model=SignalReview)
 def signal_review(payload: SignalReviewRequest) -> SignalReview:
-    return SignalReview(**market.save_signal_review(payload.model_run_id, payload.status, payload.note))
+    return SignalReview(
+        **market.save_signal_review(
+            payload.model_run_id,
+            payload.status,
+            payload.note,
+            execution_items=[item.model_dump() for item in payload.execution_items],
+        )
+    )
 
 
 @app.get("/api/model/detail", response_model=ModelDetailResponse)
