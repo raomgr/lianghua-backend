@@ -921,6 +921,15 @@ class MarketRepository:
                 prediction_groups[int(run_id)] = group.sort_values("rank").head(top_n).to_dict(orient="records")
 
         reviews = self.load_signal_reviews(run_ids)
+        replay_symbols = sorted(
+            {
+                str(item.get("symbol", "")).zfill(6)
+                for review in reviews.values()
+                for item in review.get("execution_items", [])
+                if item.get("symbol")
+            }
+        )
+        latest_price_map = self.load_latest_prices(replay_symbols, provider=active_provider) if replay_symbols else {}
         rows: list[dict] = []
         for _, run in runs.iterrows():
             model_run_id = int(run["id"])
@@ -933,6 +942,74 @@ class MarketRepository:
                     "note": "",
                     "updated_at": "",
                 },
+            )
+            execution_items = list(review.get("execution_items", []))
+            executed_items = [
+                item
+                for item in execution_items
+                if int(item.get("executed_quantity", 0) or 0) > 0 and float(item.get("executed_price", 0.0) or 0.0) > 0
+            ]
+            priced_items = []
+            detailed_execution_items = []
+            for item in executed_items:
+                symbol = str(item.get("symbol", "")).zfill(6)
+                latest_price = float(latest_price_map.get(symbol, 0.0) or 0.0)
+                executed_price = float(item.get("executed_price", 0.0) or 0.0)
+                executed_quantity = int(item.get("executed_quantity", 0) or 0)
+                action = str(item.get("action", "")).strip()
+                notional = executed_price * executed_quantity
+                latest_value = latest_price * executed_quantity if latest_price > 0 else 0.0
+                signed_return = 0.0
+                signed_pnl = 0.0
+                if latest_price <= 0 or executed_price <= 0 or executed_quantity <= 0:
+                    detailed_execution_items.append(
+                        {
+                            "symbol": symbol,
+                            "name": str(item.get("name", "") or symbol),
+                            "action": action,
+                            "planned_quantity": int(item.get("planned_quantity", 0) or 0),
+                            "executed_quantity": executed_quantity,
+                            "executed_price": executed_price,
+                            "latest_price": latest_price,
+                            "signed_return": 0.0,
+                            "signed_pnl": 0.0,
+                            "tracked": False,
+                            "note": str(item.get("note", "") or ""),
+                        }
+                    )
+                    continue
+                signed_return = (
+                    (latest_price - executed_price) / executed_price
+                    if action in {"买入", "加仓"}
+                    else (executed_price - latest_price) / executed_price
+                )
+                signed_pnl = (
+                    (latest_price - executed_price) * executed_quantity
+                    if action in {"买入", "加仓"}
+                    else (executed_price - latest_price) * executed_quantity
+                )
+                priced_items.append({"symbol": symbol, "action": action, "notional": notional, "signed_return": signed_return})
+                detailed_execution_items.append(
+                    {
+                        "symbol": symbol,
+                        "name": str(item.get("name", "") or symbol),
+                        "action": action,
+                        "planned_quantity": int(item.get("planned_quantity", 0) or 0),
+                        "executed_quantity": executed_quantity,
+                        "executed_price": executed_price,
+                        "latest_price": latest_price,
+                        "latest_value": latest_value,
+                        "signed_return": round(float(signed_return), 6),
+                        "signed_pnl": round(float(signed_pnl), 2),
+                        "tracked": True,
+                        "note": str(item.get("note", "") or ""),
+                    }
+                )
+            weighted_post_trade_move = (
+                sum(item["signed_return"] * item["notional"] for item in priced_items)
+                / sum(item["notional"] for item in priced_items)
+                if priced_items
+                else 0.0
             )
             avg_return = (
                 float(sum(float(item["predicted_return_5d"]) for item in batch_predictions) / len(batch_predictions))
@@ -955,6 +1032,13 @@ class MarketRepository:
                     "review_note": str(review["note"]),
                     "review_updated_at": str(review["updated_at"]),
                     "execution_summary": dict(review.get("execution_summary", {})),
+                    "review_performance": {
+                        "executed_items_count": len(executed_items),
+                        "priced_items_count": len(priced_items),
+                        "weighted_post_trade_move": round(float(weighted_post_trade_move), 6),
+                        "tracked_notional": round(sum(item["notional"] for item in priced_items), 2),
+                    },
+                    "execution_items": detailed_execution_items,
                 }
             )
         return rows

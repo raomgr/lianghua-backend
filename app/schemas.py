@@ -652,6 +652,8 @@ class SignalHistoryItem(BaseModel):
     review_note: str = ""
     review_updated_at: str = ""
     execution_summary: dict = Field(default_factory=dict)
+    review_performance: dict = Field(default_factory=dict)
+    execution_items: list[dict] = Field(default_factory=list)
 
 
 class SignalReviewRequest(BaseModel):
