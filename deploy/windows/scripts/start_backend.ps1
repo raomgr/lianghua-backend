@@ -12,11 +12,11 @@ if (-not (Test-Path $logRoot)) {
 }
 
 if (-not (Test-Path ".env")) {
-  throw "backend\\.env 不存在。请先创建正式配置文件，再启动后端。"
+  throw "backend/.env is missing. Create the production env file before starting the backend."
 }
 
 if (-not (Test-Path ".venv")) {
-  throw "backend\\.venv 不存在。请先执行部署初始化脚本。"
+  throw "backend/.venv is missing. Run the backend preparation script first."
 }
 
 Add-Content -Path $stdoutLog -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] starting backend service"

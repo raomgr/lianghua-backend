@@ -25,4 +25,4 @@ if (Test-Path $iisConfigPath) {
   Copy-Item $iisConfigPath (Join-Path $publishRoot "web.config") -Force
 }
 
-Write-Host "前端静态文件已发布到: $publishRoot"
+Write-Host "Frontend assets published to: $PublishRoot"

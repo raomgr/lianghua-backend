@@ -8,7 +8,7 @@ $taskName = "AshareQuantBackend"
 $scriptPath = (Resolve-Path (Join-Path $PSScriptRoot "start_backend.ps1")).Path
 
 if (-not (Test-Path $scriptPath)) {
-  throw "未找到启动脚本: $scriptPath"
+  throw "Startup script not found: $scriptPath"
 }
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
@@ -21,7 +21,7 @@ if ($StartNow) {
   Start-ScheduledTask -TaskName $taskName
 }
 
-Write-Host "已注册计划任务: $taskName"
+Write-Host "Scheduled task registered: $taskName"
 if ($StartNow) {
-  Write-Host "已立即启动计划任务: $taskName"
+  Write-Host "Scheduled task started: $taskName"
 }

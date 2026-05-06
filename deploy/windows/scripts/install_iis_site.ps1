@@ -24,4 +24,4 @@ if (-not (Get-Website -Name $SiteName -ErrorAction SilentlyContinue)) {
   Start-Website -Name $SiteName
 }
 
-Write-Host "IIS 站点已就绪: $SiteName -> $SitePath (http://$ipAddress:$Port/)"
+Write-Host "IIS site ready: $SiteName -> $SitePath (http://$ipAddress:$Port/)"

@@ -12,18 +12,18 @@ if (-not (Test-Path $logRoot)) {
 }
 
 if (-not (Test-Path ".env")) {
-  throw "backend\\.env 不存在。请先创建正式配置文件，再执行每日刷新任务。"
+  throw "backend/.env is missing. Create the production env file before running daily refresh."
 }
 
 if (-not (Test-Path ".venv")) {
-  throw "backend\\.venv 不存在。请先执行部署初始化脚本。"
+  throw "backend/.venv is missing. Run the backend preparation script first."
 }
 
 function Invoke-BackendCommand([string[]]$Arguments) {
   Add-Content -Path $stdoutLog -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] running: python $($Arguments -join ' ')"
   & .\.venv\Scripts\python @Arguments 1>> $stdoutLog 2>> $stderrLog
   if ($LASTEXITCODE -ne 0) {
-    throw "命令执行失败: python $($Arguments -join ' ')"
+    throw "Command failed: python $($Arguments -join ' ')"
   }
 }
 

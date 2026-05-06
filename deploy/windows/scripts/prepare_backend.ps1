@@ -11,7 +11,7 @@ if (-not (Test-Path ".venv")) {
 & .\.venv\Scripts\pip install -r requirements.txt
 
 if (-not (Test-Path ".env")) {
-  throw "backend\.env 不存在。请先创建正式配置文件。"
+  throw "backend/.env is missing. Create the production env file first."
 }
 
 & .\.venv\Scripts\python manage.py sync
