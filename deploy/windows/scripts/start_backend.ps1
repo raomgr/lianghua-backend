@@ -20,4 +20,17 @@ if (-not (Test-Path ".venv")) {
 }
 
 Add-Content -Path $stdoutLog -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] starting backend service"
-& .\.venv\Scripts\python manage.py run --host 0.0.0.0 --port 8000 1>> $stdoutLog 2>> $stderrLog
+$pythonExe = Join-Path $backendRoot ".venv\Scripts\python.exe"
+$arguments = @("manage.py", "run", "--host", "0.0.0.0", "--port", "8000")
+
+$process = Start-Process `
+  -FilePath $pythonExe `
+  -ArgumentList $arguments `
+  -WorkingDirectory $backendRoot `
+  -RedirectStandardOutput $stdoutLog `
+  -RedirectStandardError $stderrLog `
+  -PassThru `
+  -Wait `
+  -NoNewWindow
+
+exit $process.ExitCode
