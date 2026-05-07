@@ -569,6 +569,7 @@ class ModelPrediction(BaseModel):
     predicted_return_5d: float
     score: float
     rank: int
+    last_price: float = 0.0
     model_name: str
     run_at: str
 
@@ -646,6 +647,7 @@ class SignalHistoryItem(BaseModel):
     signal_trade_date: str
     top_symbols: list[str] = Field(default_factory=list)
     top_names: list[str] = Field(default_factory=list)
+    top_prices: list[float] = Field(default_factory=list)
     avg_predicted_return_5d: float = 0.0
     best_predicted_return_5d: float = 0.0
     review_status: str = "pending"

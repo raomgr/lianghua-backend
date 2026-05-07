@@ -291,7 +291,7 @@ class MarketService:
         )
         current_positions = self.repo.load_paper_positions(account_id=DEFAULT_SIGNAL_ACCOUNT_ID)
         current_symbols = [str(item["symbol"]) for item in current_positions]
-        relevant_symbols = sorted(set([*current_symbols, *[str(item["symbol"]) for item in predictions[:top_n]]]))
+        relevant_symbols = sorted(set([*current_symbols, *[str(item["symbol"]) for item in predictions]]))
         price_map = self.repo.load_latest_prices(relevant_symbols, provider=active_provider)
         if price_map:
             self.repo.refresh_paper_position_prices(price_map, account_id=DEFAULT_SIGNAL_ACCOUNT_ID)
@@ -464,6 +464,16 @@ class MarketService:
             else 0.0
         )
 
+        enriched_candidates = []
+        for item in predictions:
+            symbol = str(item["symbol"])
+            enriched_candidates.append(
+                {
+                    **item,
+                    "last_price": float(price_map.get(symbol, 0.0) or 0.0),
+                }
+            )
+
         return {
             "summary": {
                 "model_run_id": int(latest_run["id"]),
@@ -488,7 +498,7 @@ class MarketService:
             "review": review,
             "action_items": suggestions,
             "target_positions": target_rows,
-            "top_candidates": predictions,
+            "top_candidates": enriched_candidates,
         }
 
     def get_signal_history(self, limit: int = 12) -> list[dict]:

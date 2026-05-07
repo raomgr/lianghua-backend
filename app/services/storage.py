@@ -886,6 +886,7 @@ class MarketRepository:
             run_at
         FROM model_runs
         WHERE provider = ?
+          AND note LIKE '%Selected as current champion model.%'
         ORDER BY id DESC
         LIMIT ?
         """
@@ -923,10 +924,18 @@ class MarketRepository:
         reviews = self.load_signal_reviews(run_ids)
         replay_symbols = sorted(
             {
-                str(item.get("symbol", "")).zfill(6)
-                for review in reviews.values()
-                for item in review.get("execution_items", [])
-                if item.get("symbol")
+                *{
+                    str(item.get("symbol", "")).zfill(6)
+                    for review in reviews.values()
+                    for item in review.get("execution_items", [])
+                    if item.get("symbol")
+                },
+                *{
+                    str(item.get("symbol", "")).zfill(6)
+                    for group in prediction_groups.values()
+                    for item in group
+                    if item.get("symbol")
+                },
             }
         )
         latest_price_map = self.load_latest_prices(replay_symbols, provider=active_provider) if replay_symbols else {}
@@ -1026,6 +1035,7 @@ class MarketRepository:
                     "signal_trade_date": str(batch_predictions[0]["trade_date"]) if batch_predictions else "",
                     "top_symbols": [str(item["symbol"]) for item in batch_predictions],
                     "top_names": [str(item["name"]) for item in batch_predictions],
+                    "top_prices": [float(latest_price_map.get(str(item["symbol"]).zfill(6), 0.0) or 0.0) for item in batch_predictions],
                     "avg_predicted_return_5d": avg_return,
                     "best_predicted_return_5d": best_return,
                     "review_status": str(review["status"]),
