@@ -301,7 +301,10 @@ class TushareProvider(BaseProvider):
 
         if "amount" not in renamed.columns:
             renamed["amount"] = 0.0
-        renamed["amount"] = renamed["amount"].fillna(0.0)
+        # Tushare `daily.amount` is reported in thousand CNY, while the rest of
+        # the app formats成交额 as plain CNY. Normalize it here so downstream UI
+        # and storage can use a single yuan-based convention.
+        renamed["amount"] = renamed["amount"].fillna(0.0).astype(float) * 1000.0
         renamed["turnover_rate"] = 0.0
         renamed = renamed.sort_values("trade_date").reset_index(drop=True)
         return renamed[
