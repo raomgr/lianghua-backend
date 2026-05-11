@@ -321,12 +321,119 @@ class MarketService:
         suggestions: list[dict] = []
         target_rows: list[dict] = []
         target_symbols = [str(item["symbol"]) for item in predictions[:top_n]]
+        exited_positions = [
+            item for item in position_rows if str(item["symbol"]) not in target_symbols
+        ]
+        exited_positions = sorted(exited_positions, key=lambda item: float(item.get("market_value", 0.0)), reverse=True)
+        exited_brief = "、".join(
+            f"{str(item['symbol'])} {str(item['name'])}" for item in exited_positions[:3]
+        )
+        target_brief = "、".join(
+            f"{str(item['symbol'])} {str(item['name'])}" for item in predictions[: min(top_n, 3)]
+        )
+        ranked_predictions = [item for item in predictions]
+        ranked_prediction_map = {int(item["rank"]): item for item in ranked_predictions if item.get("rank") is not None}
+        target_prediction_map = {str(item["symbol"]): item for item in predictions[:top_n]}
+
+        def build_comparison_hint(
+            *,
+            action: str,
+            symbol: str,
+            rank: int,
+            predicted_return: float,
+            score: float,
+        ) -> str:
+            if action in {"买入", "加仓", "持有", "减仓"}:
+                next_item = ranked_prediction_map.get(rank + 1)
+                prev_item = ranked_prediction_map.get(rank - 1)
+                if rank == 1 and next_item:
+                    gap = predicted_return - float(next_item["predicted_return_5d"])
+                    return (
+                        f"当前是本轮最强信号，较第 2 名 {next_item['symbol']} {next_item['name']} "
+                        f"高出 {gap:.2%}，Alpha Score 为 {score:.3f}。"
+                    )
+                if next_item:
+                    gap = predicted_return - float(next_item["predicted_return_5d"])
+                    return (
+                        f"当前排在第 {rank}，领先下一名 {next_item['symbol']} {next_item['name']} "
+                        f"{gap:.2%}，Alpha Score 为 {score:.3f}。"
+                    )
+                if prev_item:
+                    gap = float(prev_item["predicted_return_5d"]) - predicted_return
+                    return (
+                        f"当前位于目标组合尾部，较上一名 {prev_item['symbol']} {prev_item['name']} "
+                        f"低 {gap:.2%}，需要更关注盘中确认。"
+                    )
+            if action == "卖出":
+                weakest_target = ranked_predictions[min(top_n - 1, len(ranked_predictions) - 1)] if ranked_predictions else None
+                if weakest_target:
+                    return (
+                        f"这只股票已落出目标组合，当前腾出的仓位主要会让给 "
+                        f"{weakest_target['symbol']} {weakest_target['name']} 等更强样本。"
+                    )
+            return ""
+
+        def build_selection_reason(
+            *,
+            action: str,
+            rank: int,
+            predicted_return: float,
+            score: float,
+            current_weight: float,
+            target_weight_value: float,
+        ) -> str:
+            rank_text = f"排名第 {rank}" if rank and rank < 999 else "当前不在主信号前列"
+            edge_text = f"预期 5 日收益 {predicted_return:.2%}，Alpha Score {score:.3f}"
+            if action == "买入":
+                return f"{rank_text}，首次进入目标组合。{edge_text}。"
+            if action == "加仓":
+                return f"{rank_text}，仍在目标组合内，当前权重 {current_weight:.1%} 低于目标权重 {target_weight_value:.1%}。{edge_text}。"
+            if action == "减仓":
+                return f"{rank_text}，仍保留在目标组合，但当前权重 {current_weight:.1%} 高于目标权重 {target_weight_value:.1%}。"
+            if action == "卖出":
+                return "最新目标组合已不再包含这只股票，建议退出并为新的信号腾挪仓位。"
+            return f"{rank_text}，当前仓位与目标仓位基本一致。{edge_text}。"
+
+        def build_replacement_hint(*, action: str, symbol: str) -> str:
+            if action in {"买入", "加仓"}:
+                buy_index = max(rank_index_by_symbol.get(symbol, 0), 0)
+                replaced = exited_positions[min(buy_index, len(exited_positions) - 1)] if exited_positions else None
+                if replaced:
+                    return f"这部分仓位主要替换自：{replaced['symbol']} {replaced['name']}。"
+                return f"仓位腾挪主要来自：{exited_brief}。" if exited_brief else "当前没有明确的调出样本，更多是对强信号做集中配置。"
+            if action == "卖出":
+                return f"腾出仓位后，优先让位给：{target_brief}。" if target_brief else ""
+            if action == "减仓":
+                return "减仓后仍保留在目标组合，释放出的仓位会分配给更强信号。"
+            return ""
+
+        def build_risk_hint(
+            *,
+            action: str,
+            price: float,
+            predicted_return: float,
+            current_quantity: int,
+        ) -> str:
+            if price <= 0:
+                return "当前缺少可靠价格，执行前请先核对最新行情。"
+            if action in {"买入", "加仓"} and predicted_return < 0.01:
+                return "预期收益边际不高，若盘中走势偏弱，可以适当降低优先级。"
+            if action == "卖出" and current_quantity <= 0:
+                return "当前仓位为空，确认是否已有场外处理。"
+            if action in {"买入", "加仓"} and current_quantity == 0:
+                return "这是新增开仓信号，优先确认是否符合你今天的风险预算。"
+            return "执行前结合盘中流动性、涨跌幅和你自己的仓位约束再做最终确认。"
 
         def build_target_quantity(price: float) -> int:
             if price <= 0:
                 return 0
             raw_quantity = int(target_value / price)
             return max((raw_quantity // 100) * 100, 0)
+
+        rank_index_by_symbol = {
+            str(item["symbol"]): index
+            for index, item in enumerate(predictions[:top_n])
+        }
 
         for item in predictions[:top_n]:
             symbol = str(item["symbol"])
@@ -360,10 +467,32 @@ class MarketService:
                 "delta_quantity": delta_quantity,
                 "last_price": price,
                 "current_weight": current_weight,
-                "target_weight": target_weight,
-                "suggested_value": target_value,
-                "note": note,
-            }
+                    "target_weight": target_weight,
+                    "suggested_value": target_value,
+                    "note": note,
+                    "selection_reason": build_selection_reason(
+                        action=action,
+                        rank=int(item["rank"]),
+                        predicted_return=float(item["predicted_return_5d"]),
+                        score=float(item["score"]),
+                        current_weight=current_weight,
+                        target_weight_value=target_weight,
+                    ),
+                    "comparison_hint": build_comparison_hint(
+                        action=action,
+                        symbol=symbol,
+                        rank=int(item["rank"]),
+                        predicted_return=float(item["predicted_return_5d"]),
+                        score=float(item["score"]),
+                    ),
+                    "replacement_hint": build_replacement_hint(action=action, symbol=symbol),
+                    "risk_hint": build_risk_hint(
+                        action=action,
+                        price=price,
+                        predicted_return=float(item["predicted_return_5d"]),
+                        current_quantity=current_quantity,
+                    ),
+                }
             target_rows.append(target_row)
             suggestions.append(target_row)
 
@@ -391,6 +520,28 @@ class MarketService:
                     "target_weight": 0.0,
                     "suggested_value": 0.0,
                     "note": "已不在最新目标组合中，可考虑卖出腾挪仓位。",
+                    "selection_reason": build_selection_reason(
+                        action="卖出",
+                        rank=999,
+                        predicted_return=0.0,
+                        score=0.0,
+                        current_weight=current_weight,
+                        target_weight_value=0.0,
+                    ),
+                    "comparison_hint": build_comparison_hint(
+                        action="卖出",
+                        symbol=symbol,
+                        rank=999,
+                        predicted_return=0.0,
+                        score=0.0,
+                    ),
+                    "replacement_hint": build_replacement_hint(action="卖出", symbol=symbol),
+                    "risk_hint": build_risk_hint(
+                        action="卖出",
+                        price=price,
+                        predicted_return=0.0,
+                        current_quantity=current_quantity,
+                    ),
                 }
             )
 
@@ -480,8 +631,12 @@ class MarketService:
                 "model_name": str(latest_run.get("model_name", "")),
                 "active_provider": active_provider,
                 "configured_provider": self.settings.data_provider,
+                "data_status_note": str(status.get("notes", "")),
                 "signal_trade_date": str(predictions[0]["trade_date"]) if predictions else "",
                 "generated_at": str(latest_run.get("run_at", "")),
+                "last_sync_at": str(status.get("last_sync_at", "") or ""),
+                "universe_size": int(status.get("universe_size", 0) or 0),
+                "total_bars": int(status.get("total_bars", 0) or 0),
                 "top_n": top_n,
                 "candidate_count": len(predictions),
                 "current_position_count": len(position_rows),

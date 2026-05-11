@@ -608,6 +608,10 @@ class SignalSuggestion(BaseModel):
     target_weight: float
     suggested_value: float
     note: str
+    selection_reason: str = ""
+    comparison_hint: str = ""
+    replacement_hint: str = ""
+    risk_hint: str = ""
 
 
 class SignalCenterSummary(BaseModel):
@@ -615,8 +619,12 @@ class SignalCenterSummary(BaseModel):
     model_name: str = ""
     active_provider: str = ""
     configured_provider: str = ""
+    data_status_note: str = ""
     signal_trade_date: str = ""
     generated_at: str = ""
+    last_sync_at: str = ""
+    universe_size: int = 0
+    total_bars: int = 0
     top_n: int = 0
     candidate_count: int = 0
     current_position_count: int = 0
