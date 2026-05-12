@@ -47,7 +47,7 @@ def _load_catalog() -> list[UniverseItem]:
 
 
 COMMON_A_SHARE_CATALOG = _load_catalog()
-_TUSHARE_STOCK_BASIC_CACHE: dict[str, object] = {"loaded_at": 0.0, "items": []}
+_TUSHARE_STOCK_BASIC_CACHE: dict[str, object] = {"loaded_at": 0.0, "frame": pd.DataFrame()}
 
 
 class BaseProvider:
@@ -76,6 +76,16 @@ class BaseProvider:
 
     def search_universe(self, query_text: str, limit: int = 12) -> list[UniverseItem]:
         return []
+
+    def get_stock_basics(self, symbols: list[str] | None = None) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=["symbol", "name", "area", "industry", "market", "exchange", "list_date"]
+        )
+
+    def get_daily_basics(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=["trade_date", "turnover_rate_f", "pe_ttm", "pb", "total_mv", "circ_mv"]
+        )
 
 
 def _symbol_to_ts_code(symbol: str) -> str:
@@ -278,28 +288,41 @@ class TushareProvider(BaseProvider):
     def get_universe(self) -> list[UniverseItem]:
         return self._get_basic_universe()
 
-    def _load_stock_basic_catalog(self) -> list[UniverseItem]:
+    def _load_stock_basic_frame(self) -> pd.DataFrame:
         loaded_at = float(_TUSHARE_STOCK_BASIC_CACHE.get("loaded_at", 0.0) or 0.0)
-        cached_items = _TUSHARE_STOCK_BASIC_CACHE.get("items", [])
-        if cached_items and (time() - loaded_at) < 12 * 60 * 60:
-            return list(cached_items)
+        cached_frame = _TUSHARE_STOCK_BASIC_CACHE.get("frame")
+        if isinstance(cached_frame, pd.DataFrame) and not cached_frame.empty and (time() - loaded_at) < 12 * 60 * 60:
+            return cached_frame.copy()
 
         frame = self.pro.stock_basic(
             exchange="",
             list_status="L",
-            fields="symbol,name",
+            fields="symbol,name,area,industry,market,exchange,list_date",
         )
         if frame is None or frame.empty:
-            return []
+            return pd.DataFrame()
 
-        items = [
+        normalized = frame.rename(columns=str).copy()
+        normalized["symbol"] = normalized["symbol"].astype(str).str.zfill(6)
+        normalized["name"] = normalized["name"].astype(str).str.strip()
+        for column in ["area", "industry", "market", "exchange", "list_date"]:
+            if column not in normalized.columns:
+                normalized[column] = ""
+            normalized[column] = normalized[column].fillna("").astype(str).str.strip()
+
+        _TUSHARE_STOCK_BASIC_CACHE["loaded_at"] = time()
+        _TUSHARE_STOCK_BASIC_CACHE["frame"] = normalized
+        return normalized.copy()
+
+    def _load_stock_basic_catalog(self) -> list[UniverseItem]:
+        frame = self._load_stock_basic_frame()
+        if frame.empty:
+            return []
+        return [
             UniverseItem(symbol=str(row["symbol"]).zfill(6), name=str(row["name"]).strip())
             for _, row in frame.iterrows()
             if row.get("symbol") and row.get("name")
         ]
-        _TUSHARE_STOCK_BASIC_CACHE["loaded_at"] = time()
-        _TUSHARE_STOCK_BASIC_CACHE["items"] = items
-        return list(items)
 
     def search_universe(self, query_text: str, limit: int = 12) -> list[UniverseItem]:
         normalized = query_text.strip().lower()
@@ -328,6 +351,17 @@ class TushareProvider(BaseProvider):
         matched = [item for item in items if normalized in item.symbol.lower() or normalized in item.name.lower()]
         matched.sort(key=match_score)
         return matched[:limit]
+
+    def get_stock_basics(self, symbols: list[str] | None = None) -> pd.DataFrame:
+        frame = self._load_stock_basic_frame()
+        if frame.empty:
+            return frame
+        if symbols:
+            symbol_set = {str(symbol).zfill(6) for symbol in symbols}
+            frame = frame[frame["symbol"].isin(symbol_set)]
+        return frame[
+            ["symbol", "name", "area", "industry", "market", "exchange", "list_date"]
+        ].drop_duplicates("symbol")
 
     def get_daily_bars(self, symbol: str, limit: int = 120) -> pd.DataFrame:
         end = datetime.today()
@@ -366,6 +400,31 @@ class TushareProvider(BaseProvider):
         return renamed[
             ["trade_date", "open", "high", "low", "close", "volume", "amount", "turnover_rate"]
         ].tail(limit)
+
+    def get_daily_basics(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        ts_code = _symbol_to_ts_code(symbol)
+        frame = self.pro.daily_basic(
+            ts_code=ts_code,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            fields="trade_date,turnover_rate_f,pe_ttm,pb,total_mv,circ_mv",
+        )
+        if frame is None or frame.empty:
+            return pd.DataFrame(
+                columns=["trade_date", "turnover_rate_f", "pe_ttm", "pb", "total_mv", "circ_mv"]
+            )
+
+        renamed = frame.rename(columns=str).copy()
+        renamed["trade_date"] = pd.to_datetime(renamed["trade_date"], format="%Y%m%d").dt.date
+        for column in ["turnover_rate_f", "pe_ttm", "pb", "total_mv", "circ_mv"]:
+            if column not in renamed.columns:
+                renamed[column] = np.nan
+            renamed[column] = pd.to_numeric(renamed[column], errors="coerce")
+        renamed["total_mv"] = renamed["total_mv"] * 10_000.0
+        renamed["circ_mv"] = renamed["circ_mv"] * 10_000.0
+        return renamed[
+            ["trade_date", "turnover_rate_f", "pe_ttm", "pb", "total_mv", "circ_mv"]
+        ].sort_values("trade_date")
 
 
 def get_provider(custom_universe: list[UniverseItem] | None = None) -> BaseProvider:

@@ -9,6 +9,16 @@ class StockSnapshot(BaseModel):
     latest_price: float
     pct_change: float
     volume: float
+    area: str | None = None
+    industry: str | None = None
+    market: str | None = None
+    exchange: str | None = None
+    list_date: str | None = None
+    turnover_rate_f: float | None = None
+    pe_ttm: float | None = None
+    pb: float | None = None
+    total_mv: float | None = None
+    circ_mv: float | None = None
     momentum_20: float | None = None
     volatility_20: float | None = None
     score: float | None = None
@@ -23,6 +33,11 @@ class PriceBar(BaseModel):
     volume: float
     amount: float | None = None
     turnover_rate: float | None = None
+    turnover_rate_f: float | None = None
+    pe_ttm: float | None = None
+    pb: float | None = None
+    total_mv: float | None = None
+    circ_mv: float | None = None
 
 
 class FactorResult(BaseModel):
@@ -582,6 +597,14 @@ class ModelPrediction(BaseModel):
     score: float
     rank: int
     last_price: float = 0.0
+    industry: str | None = None
+    market: str | None = None
+    area: str | None = None
+    turnover_rate_f: float | None = None
+    pe_ttm: float | None = None
+    pb: float | None = None
+    total_mv: float | None = None
+    circ_mv: float | None = None
     model_name: str
     run_at: str
 
@@ -616,6 +639,14 @@ class SignalSuggestion(BaseModel):
     target_quantity: int
     delta_quantity: int
     last_price: float
+    industry: str | None = None
+    market: str | None = None
+    area: str | None = None
+    turnover_rate_f: float | None = None
+    pe_ttm: float | None = None
+    pb: float | None = None
+    total_mv: float | None = None
+    circ_mv: float | None = None
     current_weight: float
     target_weight: float
     suggested_value: float

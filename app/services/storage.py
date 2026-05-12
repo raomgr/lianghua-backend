@@ -35,6 +35,11 @@ class MarketRepository:
                 CREATE TABLE IF NOT EXISTS universe (
                     symbol TEXT NOT NULL,
                     name TEXT NOT NULL,
+                    area TEXT,
+                    industry TEXT,
+                    market TEXT,
+                    exchange TEXT,
+                    list_date TEXT,
                     provider TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(symbol, provider)
@@ -53,6 +58,11 @@ class MarketRepository:
                     volume REAL NOT NULL,
                     amount REAL NOT NULL DEFAULT 0,
                     turnover_rate REAL NOT NULL DEFAULT 0,
+                    turnover_rate_f REAL,
+                    pe_ttm REAL,
+                    pb REAL,
+                    total_mv REAL,
+                    circ_mv REAL,
                     provider TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(symbol, trade_date, provider)
@@ -73,6 +83,16 @@ class MarketRepository:
             )
             self._ensure_column(conn, "daily_bars", "amount", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(conn, "daily_bars", "turnover_rate", "REAL NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "daily_bars", "turnover_rate_f", "REAL")
+            self._ensure_column(conn, "daily_bars", "pe_ttm", "REAL")
+            self._ensure_column(conn, "daily_bars", "pb", "REAL")
+            self._ensure_column(conn, "daily_bars", "total_mv", "REAL")
+            self._ensure_column(conn, "daily_bars", "circ_mv", "REAL")
+            self._ensure_column(conn, "universe", "area", "TEXT")
+            self._ensure_column(conn, "universe", "industry", "TEXT")
+            self._ensure_column(conn, "universe", "market", "TEXT")
+            self._ensure_column(conn, "universe", "exchange", "TEXT")
+            self._ensure_column(conn, "universe", "list_date", "TEXT")
             self._migrate_universe_primary_key(conn)
             self._migrate_daily_bars_primary_key(conn)
             conn.execute(
@@ -319,11 +339,23 @@ class MarketRepository:
         if self._table_primary_key_columns(conn, "universe") == ["symbol", "provider"]:
             return
 
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(universe)").fetchall()}
+        area_expr = "area" if "area" in columns else "''"
+        industry_expr = "industry" if "industry" in columns else "''"
+        market_expr = "market" if "market" in columns else "''"
+        exchange_expr = "exchange" if "exchange" in columns else "''"
+        list_date_expr = "list_date" if "list_date" in columns else "''"
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS universe_v2 (
                 symbol TEXT NOT NULL,
                 name TEXT NOT NULL,
+                area TEXT,
+                industry TEXT,
+                market TEXT,
+                exchange TEXT,
+                list_date TEXT,
                 provider TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(symbol, provider)
@@ -332,9 +364,18 @@ class MarketRepository:
         )
         conn.execute("DELETE FROM universe_v2")
         conn.execute(
-            """
-            INSERT INTO universe_v2(symbol, name, provider, updated_at)
-            SELECT symbol, name, provider, updated_at
+            f"""
+            INSERT INTO universe_v2(symbol, name, area, industry, market, exchange, list_date, provider, updated_at)
+            SELECT
+                symbol,
+                name,
+                COALESCE({area_expr}, ''),
+                COALESCE({industry_expr}, ''),
+                COALESCE({market_expr}, ''),
+                COALESCE({exchange_expr}, ''),
+                COALESCE({list_date_expr}, ''),
+                provider,
+                updated_at
             FROM universe
             """
         )
@@ -348,6 +389,11 @@ class MarketRepository:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_bars)").fetchall()}
         amount_expr = "amount" if "amount" in columns else "0"
         turnover_expr = "turnover_rate" if "turnover_rate" in columns else "0"
+        turnover_f_expr = "turnover_rate_f" if "turnover_rate_f" in columns else "NULL"
+        pe_ttm_expr = "pe_ttm" if "pe_ttm" in columns else "NULL"
+        pb_expr = "pb" if "pb" in columns else "NULL"
+        total_mv_expr = "total_mv" if "total_mv" in columns else "NULL"
+        circ_mv_expr = "circ_mv" if "circ_mv" in columns else "NULL"
 
         conn.execute(
             """
@@ -361,6 +407,11 @@ class MarketRepository:
                 volume REAL NOT NULL,
                 amount REAL NOT NULL DEFAULT 0,
                 turnover_rate REAL NOT NULL DEFAULT 0,
+                turnover_rate_f REAL,
+                pe_ttm REAL,
+                pb REAL,
+                total_mv REAL,
+                circ_mv REAL,
                 provider TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(symbol, trade_date, provider)
@@ -371,7 +422,8 @@ class MarketRepository:
         conn.execute(
             f"""
             INSERT INTO daily_bars_v2(
-                symbol, trade_date, open, high, low, close, volume, amount, turnover_rate, provider, updated_at
+                symbol, trade_date, open, high, low, close, volume, amount, turnover_rate,
+                turnover_rate_f, pe_ttm, pb, total_mv, circ_mv, provider, updated_at
             )
             SELECT
                 symbol,
@@ -383,6 +435,11 @@ class MarketRepository:
                 volume,
                 {amount_expr},
                 {turnover_expr},
+                {turnover_f_expr},
+                {pe_ttm_expr},
+                {pb_expr},
+                {total_mv_expr},
+                {circ_mv_expr},
                 provider,
                 updated_at
             FROM daily_bars
@@ -419,29 +476,62 @@ class MarketRepository:
         universe = provider.get_universe()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         bars_written = 0
+        stock_basics = provider.get_stock_basics([item.symbol for item in universe])
+        stock_basic_map = (
+            stock_basics.set_index("symbol").to_dict(orient="index")
+            if not stock_basics.empty and "symbol" in stock_basics.columns
+            else {}
+        )
 
         with self.connect() as conn:
             for item in universe:
+                profile = stock_basic_map.get(item.symbol, {})
                 conn.execute(
                     """
-                    INSERT INTO universe(symbol, name, provider, updated_at)
-                    VALUES(?, ?, ?, ?)
+                    INSERT INTO universe(symbol, name, area, industry, market, exchange, list_date, provider, updated_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(symbol, provider) DO UPDATE SET
                         name=excluded.name,
+                        area=excluded.area,
+                        industry=excluded.industry,
+                        market=excluded.market,
+                        exchange=excluded.exchange,
+                        list_date=excluded.list_date,
                         updated_at=excluded.updated_at
                     """,
-                    (item.symbol, item.name, provider_name, now),
+                    (
+                        item.symbol,
+                        item.name,
+                        str(profile.get("area", "") or ""),
+                        str(profile.get("industry", "") or ""),
+                        str(profile.get("market", "") or ""),
+                        str(profile.get("exchange", "") or ""),
+                        str(profile.get("list_date", "") or ""),
+                        provider_name,
+                        now,
+                    ),
                 )
 
                 bars = provider.get_daily_bars(item.symbol, limit=180).copy()
+                basics = provider.get_daily_basics(
+                    item.symbol,
+                    datetime.combine(pd.to_datetime(bars["trade_date"].min()).date(), datetime.min.time()),
+                    datetime.combine(pd.to_datetime(bars["trade_date"].max()).date(), datetime.min.time()),
+                )
+                if not basics.empty:
+                    bars = bars.merge(basics, on="trade_date", how="left")
+                for column in ["turnover_rate_f", "pe_ttm", "pb", "total_mv", "circ_mv"]:
+                    if column not in bars.columns:
+                        bars[column] = None
                 bars["trade_date"] = bars["trade_date"].astype(str)
                 for _, row in bars.iterrows():
                     conn.execute(
                         """
                         INSERT INTO daily_bars(
-                            symbol, trade_date, open, high, low, close, volume, amount, turnover_rate, provider, updated_at
+                            symbol, trade_date, open, high, low, close, volume, amount, turnover_rate,
+                            turnover_rate_f, pe_ttm, pb, total_mv, circ_mv, provider, updated_at
                         )
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(symbol, trade_date, provider) DO UPDATE SET
                             open=excluded.open,
                             high=excluded.high,
@@ -450,6 +540,11 @@ class MarketRepository:
                             volume=excluded.volume,
                             amount=excluded.amount,
                             turnover_rate=excluded.turnover_rate,
+                            turnover_rate_f=excluded.turnover_rate_f,
+                            pe_ttm=excluded.pe_ttm,
+                            pb=excluded.pb,
+                            total_mv=excluded.total_mv,
+                            circ_mv=excluded.circ_mv,
                             updated_at=excluded.updated_at
                         """,
                         (
@@ -462,6 +557,11 @@ class MarketRepository:
                             float(row["volume"]),
                             float(row.get("amount", 0.0)),
                             float(row.get("turnover_rate", 0.0)),
+                            float(row["turnover_rate_f"]) if pd.notna(row.get("turnover_rate_f")) else None,
+                            float(row["pe_ttm"]) if pd.notna(row.get("pe_ttm")) else None,
+                            float(row["pb"]) if pd.notna(row.get("pb")) else None,
+                            float(row["total_mv"]) if pd.notna(row.get("total_mv")) else None,
+                            float(row["circ_mv"]) if pd.notna(row.get("circ_mv")) else None,
                             provider_name,
                             now,
                         ),
@@ -494,7 +594,8 @@ class MarketRepository:
     def load_symbol_history(self, symbol: str, limit: int = 180, provider: str | None = None) -> pd.DataFrame:
         active_provider = provider or self.default_provider
         query = """
-        SELECT trade_date, open, high, low, close, volume, amount, turnover_rate
+        SELECT trade_date, open, high, low, close, volume, amount, turnover_rate,
+               turnover_rate_f, pe_ttm, pb, total_mv, circ_mv
         FROM daily_bars
         WHERE symbol = ? AND provider = ?
         ORDER BY trade_date DESC
@@ -514,7 +615,12 @@ class MarketRepository:
         active_provider = provider or self.default_provider
         with self.connect() as conn:
             return pd.read_sql_query(
-                "SELECT symbol, name FROM universe WHERE provider = ? ORDER BY symbol",
+                """
+                SELECT symbol, name, area, industry, market, exchange, list_date
+                FROM universe
+                WHERE provider = ?
+                ORDER BY symbol
+                """,
                 conn,
                 params=(active_provider,),
             )

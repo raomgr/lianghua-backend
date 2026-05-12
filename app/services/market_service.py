@@ -245,9 +245,20 @@ class MarketService:
         self.ensure_seed_data()
         return self.repo.load_all_histories(limit=limit, provider=self.active_data_provider)
 
+    @staticmethod
+    def _sanitize_frame(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        return frame.astype(object).where(pd.notna(frame), None)
+
     def get_stock_snapshot(self) -> pd.DataFrame:
         histories = self._load_histories(limit=40)
-        names = self._load_names()
+        universe = self.repo.load_universe(provider=self.active_data_provider)
+        profile_map = (
+            universe.set_index("symbol").to_dict(orient="index")
+            if not universe.empty and "symbol" in universe.columns
+            else {}
+        )
         factors = self.get_factor_table()
         factor_cols = factors[["symbol", "momentum_20", "volatility_20", "score"]] if not factors.empty else pd.DataFrame()
 
@@ -257,24 +268,37 @@ class MarketService:
                 continue
             latest = bars.iloc[-1]
             prev = bars.iloc[-2]
+            profile = profile_map.get(symbol, {})
             rows.append(
                 {
                     "symbol": symbol,
-                    "name": names.get(symbol, symbol),
+                    "name": str(profile.get("name", symbol)),
                     "latest_price": round(float(latest["close"]), 2),
                     "pct_change": round((float(latest["close"]) / float(prev["close"]) - 1) * 100, 2),
                     "volume": round(float(latest["volume"]), 2),
+                    "area": str(profile.get("area", "") or ""),
+                    "industry": str(profile.get("industry", "") or ""),
+                    "market": str(profile.get("market", "") or ""),
+                    "exchange": str(profile.get("exchange", "") or ""),
+                    "list_date": str(profile.get("list_date", "") or ""),
+                    "turnover_rate_f": float(latest["turnover_rate_f"]) if pd.notna(latest.get("turnover_rate_f")) else None,
+                    "pe_ttm": float(latest["pe_ttm"]) if pd.notna(latest.get("pe_ttm")) else None,
+                    "pb": float(latest["pb"]) if pd.notna(latest.get("pb")) else None,
+                    "total_mv": float(latest["total_mv"]) if pd.notna(latest.get("total_mv")) else None,
+                    "circ_mv": float(latest["circ_mv"]) if pd.notna(latest.get("circ_mv")) else None,
                 }
             )
 
         snapshot = pd.DataFrame(rows)
         if snapshot.empty or factor_cols.empty:
-            return snapshot
-        return snapshot.merge(factor_cols, on="symbol", how="left")
+            return self._sanitize_frame(snapshot)
+        merged = snapshot.merge(factor_cols, on="symbol", how="left")
+        return self._sanitize_frame(merged)
 
     def get_stock_history(self, symbol: str, limit: int = 90) -> pd.DataFrame:
         self.ensure_seed_data()
-        return self.repo.load_symbol_history(symbol, limit=limit, provider=self.active_data_provider)
+        history = self.repo.load_symbol_history(symbol, limit=limit, provider=self.active_data_provider)
+        return self._sanitize_frame(history)
 
     def get_signal_center(self, candidate_limit: int = 10) -> dict:
         from app.services.modeling import get_model_status, resolve_active_provider
@@ -310,6 +334,12 @@ class MarketService:
             provider=active_provider,
             model_name=latest_run.get("model_name"),
         )
+        universe = self.repo.load_universe(provider=active_provider)
+        profile_map = (
+            universe.set_index("symbol").to_dict(orient="index")
+            if not universe.empty and "symbol" in universe.columns
+            else {}
+        )
         current_positions = self.repo.load_paper_positions(account_id=DEFAULT_SIGNAL_ACCOUNT_ID)
         current_symbols = [str(item["symbol"]) for item in current_positions]
         relevant_symbols = sorted(set([*current_symbols, *[str(item["symbol"]) for item in predictions]]))
@@ -328,6 +358,11 @@ class MarketService:
                 "volume": float(latest.get("volume", 0.0) or 0.0),
                 "amount": float(latest.get("amount", 0.0) or 0.0),
                 "turnover_rate": float(latest.get("turnover_rate", 0.0) or 0.0),
+                "turnover_rate_f": float(latest.get("turnover_rate_f", 0.0) or 0.0),
+                "pe_ttm": float(latest.get("pe_ttm", 0.0) or 0.0) if pd.notna(latest.get("pe_ttm")) else None,
+                "pb": float(latest.get("pb", 0.0) or 0.0) if pd.notna(latest.get("pb")) else None,
+                "total_mv": float(latest.get("total_mv", 0.0) or 0.0) if pd.notna(latest.get("total_mv")) else None,
+                "circ_mv": float(latest.get("circ_mv", 0.0) or 0.0) if pd.notna(latest.get("circ_mv")) else None,
             }
         if price_map:
             self.repo.refresh_paper_position_prices(price_map, account_id=DEFAULT_SIGNAL_ACCOUNT_ID)
@@ -338,12 +373,22 @@ class MarketService:
         market_value = 0.0
         current_position_map: dict[str, dict] = {}
         for item in current_positions:
+            profile = profile_map.get(str(item["symbol"]), {})
+            latest_bar = latest_bar_map.get(str(item["symbol"]), {})
             last_price = float(price_map.get(str(item["symbol"]), item.get("last_price", 0.0)) or 0.0)
             quantity = int(item["quantity"])
             row = {
                 **item,
                 "last_price": last_price,
                 "market_value": float(last_price * quantity),
+                "industry": str(profile.get("industry", "") or ""),
+                "market": str(profile.get("market", "") or ""),
+                "area": str(profile.get("area", "") or ""),
+                "turnover_rate_f": float(latest_bar.get("turnover_rate_f", 0.0) or 0.0) if latest_bar.get("turnover_rate_f") is not None else None,
+                "pe_ttm": latest_bar.get("pe_ttm"),
+                "pb": latest_bar.get("pb"),
+                "total_mv": latest_bar.get("total_mv"),
+                "circ_mv": latest_bar.get("circ_mv"),
             }
             market_value += row["market_value"]
             position_rows.append(row)
@@ -657,6 +702,7 @@ class MarketService:
         for item in eligible_predictions:
             symbol = str(item["symbol"])
             current = current_position_map.get(symbol)
+            profile = profile_map.get(symbol, {})
             price = float(price_map.get(symbol, current.get("last_price", 0.0) if current else 0.0) or 0.0)
             latest_bar = latest_bar_map.get(symbol, {})
             current_quantity = int(current["quantity"]) if current else 0
@@ -700,39 +746,47 @@ class MarketService:
                 "target_quantity": target_quantity,
                 "delta_quantity": delta_quantity,
                 "last_price": price,
+                "industry": str(profile.get("industry", "") or ""),
+                "market": str(profile.get("market", "") or ""),
+                "area": str(profile.get("area", "") or ""),
+                "turnover_rate_f": float(latest_bar.get("turnover_rate_f", 0.0) or 0.0) if latest_bar.get("turnover_rate_f") is not None else None,
+                "pe_ttm": latest_bar.get("pe_ttm"),
+                "pb": latest_bar.get("pb"),
+                "total_mv": latest_bar.get("total_mv"),
+                "circ_mv": latest_bar.get("circ_mv"),
                 "current_weight": current_weight,
-                    "target_weight": target_weight,
-                    "suggested_value": target_value,
-                    "note": note,
-                    "selection_reason": build_selection_reason(
-                        action=action,
-                        rank=int(item["rank"]),
-                        predicted_return=float(item["predicted_return_5d"]),
-                        score=float(item["score"]),
-                        current_weight=current_weight,
-                        target_weight_value=target_weight,
-                    ),
-                    "comparison_hint": build_comparison_hint(
-                        action=action,
-                        symbol=symbol,
-                        rank=int(item["rank"]),
-                        predicted_return=float(item["predicted_return_5d"]),
-                        score=float(item["score"]),
-                    ),
-                    "replacement_hint": build_replacement_hint(action=action, symbol=symbol),
-                    "risk_hint": build_risk_hint(
-                        action=action,
-                        price=price,
-                        predicted_return=float(item["predicted_return_5d"]),
-                        current_quantity=current_quantity,
-                    ),
-                    "sellable_quantity": sellable_quantity,
-                    "buy_locked_quantity": buy_locked_quantity,
-                    "executable_quantity": executable_quantity,
-                    "constraint_level": constraint_level,
-                    "execution_constraint": execution_constraint,
-                    "pretrade_flags": pretrade_flags,
-                }
+                "target_weight": target_weight,
+                "suggested_value": target_value,
+                "note": note,
+                "selection_reason": build_selection_reason(
+                    action=action,
+                    rank=int(item["rank"]),
+                    predicted_return=float(item["predicted_return_5d"]),
+                    score=float(item["score"]),
+                    current_weight=current_weight,
+                    target_weight_value=target_weight,
+                ),
+                "comparison_hint": build_comparison_hint(
+                    action=action,
+                    symbol=symbol,
+                    rank=int(item["rank"]),
+                    predicted_return=float(item["predicted_return_5d"]),
+                    score=float(item["score"]),
+                ),
+                "replacement_hint": build_replacement_hint(action=action, symbol=symbol),
+                "risk_hint": build_risk_hint(
+                    action=action,
+                    price=price,
+                    predicted_return=float(item["predicted_return_5d"]),
+                    current_quantity=current_quantity,
+                ),
+                "sellable_quantity": sellable_quantity,
+                "buy_locked_quantity": buy_locked_quantity,
+                "executable_quantity": executable_quantity,
+                "constraint_level": constraint_level,
+                "execution_constraint": execution_constraint,
+                "pretrade_flags": pretrade_flags,
+            }
             target_rows.append(target_row)
             suggestions.append(target_row)
 
@@ -771,6 +825,14 @@ class MarketService:
                     "target_quantity": 0,
                     "delta_quantity": -current_quantity,
                     "last_price": price,
+                    "industry": str(item.get("industry", "") or ""),
+                    "market": str(item.get("market", "") or ""),
+                    "area": str(item.get("area", "") or ""),
+                    "turnover_rate_f": item.get("turnover_rate_f"),
+                    "pe_ttm": item.get("pe_ttm"),
+                    "pb": item.get("pb"),
+                    "total_mv": item.get("total_mv"),
+                    "circ_mv": item.get("circ_mv"),
                     "current_weight": current_weight,
                     "target_weight": 0.0,
                     "suggested_value": 0.0,
@@ -1105,10 +1167,20 @@ class MarketService:
         enriched_candidates = []
         for item in predictions:
             symbol = str(item["symbol"])
+            profile = profile_map.get(symbol, {})
+            latest_bar = latest_bar_map.get(symbol, {})
             enriched_candidates.append(
                 {
                     **item,
                     "last_price": float(price_map.get(symbol, 0.0) or 0.0),
+                    "industry": str(profile.get("industry", "") or ""),
+                    "market": str(profile.get("market", "") or ""),
+                    "area": str(profile.get("area", "") or ""),
+                    "turnover_rate_f": float(latest_bar.get("turnover_rate_f", 0.0) or 0.0) if latest_bar.get("turnover_rate_f") is not None else None,
+                    "pe_ttm": latest_bar.get("pe_ttm"),
+                    "pb": latest_bar.get("pb"),
+                    "total_mv": latest_bar.get("total_mv"),
+                    "circ_mv": latest_bar.get("circ_mv"),
                 }
             )
 
