@@ -111,6 +111,20 @@ class MarketRepository:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS train_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    message TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS custom_universe (
                     symbol TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -259,10 +273,16 @@ class MarketRepository:
                     fill_ratio REAL NOT NULL DEFAULT 1.0,
                     max_drawdown_limit REAL NOT NULL DEFAULT 0.18,
                     max_equity_change_limit REAL NOT NULL DEFAULT 0.04,
+                    min_signal_return_pct REAL NOT NULL DEFAULT 0.01,
+                    min_liquidity_amount REAL NOT NULL DEFAULT 30000000,
+                    min_turnover_rate REAL NOT NULL DEFAULT 0.002,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_column(conn, "paper_daily_settings", "min_signal_return_pct", "REAL NOT NULL DEFAULT 0.01")
+            self._ensure_column(conn, "paper_daily_settings", "min_liquidity_amount", "REAL NOT NULL DEFAULT 30000000")
+            self._ensure_column(conn, "paper_daily_settings", "min_turnover_rate", "REAL NOT NULL DEFAULT 0.002")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS paper_daily_runs (
@@ -746,6 +766,83 @@ class MarketRepository:
             return []
 
         return frame.to_dict(orient="records")
+
+    def create_train_job(self, job_id: str, status: str, message: str = "") -> dict:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO train_jobs(job_id, status, message, started_at, finished_at, error, result_json, updated_at)
+                VALUES(?, ?, ?, '', '', '', '{}', ?)
+                """,
+                (job_id, status, message, now),
+            )
+        return self.load_train_job(job_id)
+
+    def update_train_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        message: str | None = None,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+        error: str | None = None,
+        result: dict | None = None,
+    ) -> dict:
+        current = self.load_train_job(job_id)
+        if not current:
+            raise KeyError(f"Unknown train job: {job_id}")
+
+        next_message = current["message"] if message is None else message
+        next_started_at = current["started_at"] if started_at is None else started_at
+        next_finished_at = current["finished_at"] if finished_at is None else finished_at
+        next_error = current["error"] if error is None else error
+        next_result = current["result"] if result is None else result
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE train_jobs
+                SET status = ?, message = ?, started_at = ?, finished_at = ?, error = ?, result_json = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    status,
+                    next_message,
+                    next_started_at,
+                    next_finished_at,
+                    next_error,
+                    json.dumps(next_result or {}, ensure_ascii=True),
+                    updated_at,
+                    job_id,
+                ),
+            )
+        return self.load_train_job(job_id)
+
+    def load_train_job(self, job_id: str) -> dict:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT job_id, status, message, started_at, finished_at, error, result_json
+                FROM train_jobs
+                WHERE job_id = ?
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+        if not row:
+            return {}
+        return {
+            "job_id": row[0],
+            "status": row[1],
+            "message": row[2] or "",
+            "started_at": row[3] or "",
+            "finished_at": row[4] or "",
+            "error": row[5] or "",
+            "result": (lambda payload: payload if payload else None)(json.loads(row[6] or "{}")),
+        }
 
     def save_signal_review(
         self,
@@ -1787,9 +1884,10 @@ class MarketRepository:
                     account_id, enabled, run_time, auto_sync, auto_train, auto_rebalance,
                     top_n, capital_fraction, max_position_weight, min_cash_buffer_ratio,
                     max_turnover_ratio, stop_loss_pct, take_profit_pct, fill_ratio,
-                    max_drawdown_limit, max_equity_change_limit, updated_at
+                    max_drawdown_limit, max_equity_change_limit, min_signal_return_pct,
+                    min_liquidity_amount, min_turnover_rate, updated_at
                 )
-                VALUES(?, 0, '15:10', 1, 1, 1, 3, 0.95, 0.35, 0.05, 1.0, 0.1, 0.2, 1.0, 0.18, 0.04, ?)
+                VALUES(?, 0, '15:10', 1, 1, 1, 3, 0.95, 0.35, 0.05, 1.0, 0.1, 0.2, 1.0, 0.18, 0.04, 0.01, 30000000, 0.002, ?)
                 ON CONFLICT(account_id) DO NOTHING
                 """,
                 (account_id, updated_at),
@@ -1800,7 +1898,8 @@ class MarketRepository:
                     account_id, enabled, run_time, auto_sync, auto_train, auto_rebalance,
                     top_n, capital_fraction, max_position_weight, min_cash_buffer_ratio,
                     max_turnover_ratio, stop_loss_pct, take_profit_pct, fill_ratio,
-                    max_drawdown_limit, max_equity_change_limit, updated_at
+                    max_drawdown_limit, max_equity_change_limit, min_signal_return_pct,
+                    min_liquidity_amount, min_turnover_rate, updated_at
                 FROM paper_daily_settings
                 WHERE account_id = ?
                 LIMIT 1
@@ -1824,7 +1923,10 @@ class MarketRepository:
             "fill_ratio": float(row[13]),
             "max_drawdown_limit": float(row[14]),
             "max_equity_change_limit": float(row[15]),
-            "updated_at": row[16],
+            "min_signal_return_pct": float(row[16]),
+            "min_liquidity_amount": float(row[17]),
+            "min_turnover_rate": float(row[18]),
+            "updated_at": row[19],
         }
 
     def load_paper_daily_settings(self, account_id: str = "default") -> dict:
@@ -1841,7 +1943,8 @@ class MarketRepository:
                 SET enabled = ?, run_time = ?, auto_sync = ?, auto_train = ?, auto_rebalance = ?,
                     top_n = ?, capital_fraction = ?, max_position_weight = ?, min_cash_buffer_ratio = ?,
                     max_turnover_ratio = ?, stop_loss_pct = ?, take_profit_pct = ?, fill_ratio = ?,
-                    max_drawdown_limit = ?, max_equity_change_limit = ?, updated_at = ?
+                    max_drawdown_limit = ?, max_equity_change_limit = ?, min_signal_return_pct = ?,
+                    min_liquidity_amount = ?, min_turnover_rate = ?, updated_at = ?
                 WHERE account_id = ?
                 """,
                 (
@@ -1860,6 +1963,9 @@ class MarketRepository:
                     float(next_values["fill_ratio"]),
                     float(next_values["max_drawdown_limit"]),
                     float(next_values["max_equity_change_limit"]),
+                    float(next_values["min_signal_return_pct"]),
+                    float(next_values["min_liquidity_amount"]),
+                    float(next_values["min_turnover_rate"]),
                     updated_at,
                     account_id,
                 ),

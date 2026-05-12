@@ -32,6 +32,7 @@ from app.schemas import (
     PriceBar,
     StockSnapshot,
     TrainResponse,
+    TrainJobResponse,
     UpdateResponse,
 )
 from app.services.market_service import MarketService
@@ -39,13 +40,14 @@ from app.services.paper_trading import PaperTradingService
 from app.services.paper_scheduler import PaperDailyScheduler
 from app.services.modeling import get_model_status, resolve_active_provider
 from app.services.storage import MarketRepository
-from app.services.training import train_local_model
+from app.services.train_jobs import TrainJobService
 
 settings = get_settings()
 app = FastAPI(title=settings.app_name)
 market = MarketService()
 paper = PaperTradingService(market)
 scheduler = PaperDailyScheduler(paper)
+train_jobs = TrainJobService(market)
 
 app.add_middleware(
     CORSMiddleware,
@@ -246,6 +248,9 @@ def paper_rebalance_preview(payload: PaperRebalanceRequest) -> PaperTradingSnaps
             fill_ratio=payload.fill_ratio,
             max_drawdown_limit=payload.max_drawdown_limit,
             max_equity_change_limit=payload.max_equity_change_limit,
+            min_signal_return_pct=payload.min_signal_return_pct,
+            min_liquidity_amount=payload.min_liquidity_amount,
+            min_turnover_rate=payload.min_turnover_rate,
         ))
     )
 
@@ -265,6 +270,9 @@ def paper_rebalance(payload: PaperRebalanceRequest) -> PaperTradingSnapshot:
             fill_ratio=payload.fill_ratio,
             max_drawdown_limit=payload.max_drawdown_limit,
             max_equity_change_limit=payload.max_equity_change_limit,
+            min_signal_return_pct=payload.min_signal_return_pct,
+            min_liquidity_amount=payload.min_liquidity_amount,
+            min_turnover_rate=payload.min_turnover_rate,
         ))
     )
 
@@ -303,6 +311,9 @@ def paper_daily_settings(payload: PaperDailySettingsRequest) -> PaperTradingSnap
             fill_ratio=payload.fill_ratio,
             max_drawdown_limit=payload.max_drawdown_limit,
             max_equity_change_limit=payload.max_equity_change_limit,
+            min_signal_return_pct=payload.min_signal_return_pct,
+            min_liquidity_amount=payload.min_liquidity_amount,
+            min_turnover_rate=payload.min_turnover_rate,
         ))
     )
 
@@ -360,7 +371,8 @@ def signal_center() -> SignalCenterResponse:
 
 
 @app.get("/api/signals/history", response_model=list[SignalHistoryItem])
-def signal_history(limit: int = Query(12, ge=3, le=40)) -> list[SignalHistoryItem]:
+def signal_history(limit: int = 12) -> list[SignalHistoryItem]:
+    limit = max(3, min(int(limit), 40))
     return [SignalHistoryItem(**row) for row in market.get_signal_history(limit=limit)]
 
 
@@ -412,16 +424,34 @@ def model_runs() -> list[ModelRunInfo]:
     return [ModelRunInfo(**row) for row in repo.load_recent_model_runs(limit=6, provider=resolve_active_provider(repo))]
 
 
-@app.post("/api/model/train", response_model=TrainResponse)
-def train_model() -> TrainResponse:
-    histories, names = market.get_training_inputs(limit=220)
-    result = train_local_model(
-        histories,
-        names,
-        provider_name=market.active_data_provider,
-        configured_provider=settings.data_provider,
+@app.post("/api/model/train", response_model=TrainJobResponse)
+def train_model() -> TrainJobResponse:
+    return TrainJobResponse(**train_jobs.start())
+
+
+@app.get("/api/model/train/{job_id}", response_model=TrainJobResponse)
+def train_model_job(job_id: str) -> TrainJobResponse:
+    job = train_jobs.get(job_id)
+    if not job:
+        return TrainJobResponse(
+            job_id=job_id,
+            status="missing",
+            message="训练任务不存在或已过期。",
+            error="missing",
+            result=None,
+        )
+    result = job.get("result") or None
+    if result is not None:
+        result = TrainResponse(**result)
+    return TrainJobResponse(
+        job_id=job["job_id"],
+        status=job["status"],
+        message=job.get("message", ""),
+        started_at=job.get("started_at", ""),
+        finished_at=job.get("finished_at", ""),
+        error=job.get("error", ""),
+        result=result,
     )
-    return TrainResponse(**result)
 
 
 @app.post("/api/tasks/update", response_model=UpdateResponse)

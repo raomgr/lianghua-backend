@@ -374,6 +374,9 @@ class PaperDailySettings(BaseModel):
     fill_ratio: float = 1.0
     max_drawdown_limit: float = 0.18
     max_equity_change_limit: float = 0.04
+    min_signal_return_pct: float = 0.01
+    min_liquidity_amount: float = 30_000_000.0
+    min_turnover_rate: float = 0.002
     updated_at: str
 
 
@@ -462,6 +465,9 @@ class PaperPreviewConfig(BaseModel):
     fill_ratio: float
     max_drawdown_limit: float
     max_equity_change_limit: float
+    min_signal_return_pct: float = 0.01
+    min_liquidity_amount: float = 30_000_000.0
+    min_turnover_rate: float = 0.002
     board_lot: int
 
 
@@ -507,6 +513,9 @@ class PaperRebalanceRequest(BaseModel):
     fill_ratio: float = 1.0
     max_drawdown_limit: float = 0.18
     max_equity_change_limit: float = 0.04
+    min_signal_return_pct: float = 0.01
+    min_liquidity_amount: float = 30_000_000.0
+    min_turnover_rate: float = 0.002
 
 
 class PaperPreviewActionRequest(BaseModel):
@@ -534,6 +543,9 @@ class PaperDailySettingsRequest(BaseModel):
     fill_ratio: float = 1.0
     max_drawdown_limit: float = 0.18
     max_equity_change_limit: float = 0.04
+    min_signal_return_pct: float = 0.01
+    min_liquidity_amount: float = 30_000_000.0
+    min_turnover_rate: float = 0.002
 
 
 class PaperDailyRunRequest(BaseModel):
@@ -612,6 +624,12 @@ class SignalSuggestion(BaseModel):
     comparison_hint: str = ""
     replacement_hint: str = ""
     risk_hint: str = ""
+    sellable_quantity: int = 0
+    buy_locked_quantity: int = 0
+    executable_quantity: int = 0
+    constraint_level: str = "normal"
+    execution_constraint: str = ""
+    pretrade_flags: list[str] = Field(default_factory=list)
 
 
 class SignalCenterSummary(BaseModel):
@@ -635,6 +653,29 @@ class SignalCenterSummary(BaseModel):
     target_weight_per_position: float = 0.0
     avg_predicted_return_5d: float = 0.0
     estimated_turnover_count: int = 0
+    planned_buy_amount: float = 0.0
+    planned_sell_amount: float = 0.0
+    estimated_cash_after_signal: float = 0.0
+    min_cash_buffer_required: float = 0.0
+    estimated_turnover_ratio: float = 0.0
+    max_turnover_ratio: float = 0.0
+    target_utilization_ratio: float = 0.0
+    new_position_count: int = 0
+    exit_position_count: int = 0
+    max_target_position_weight: float = 0.0
+    top_two_target_weight_share: float = 0.0
+    effective_holding_count: float = 0.0
+    current_board_exposure_breakdown: list[str] = Field(default_factory=list)
+    dominant_board_bucket: str = ""
+    dominant_board_share: float = 0.0
+    board_exposure_breakdown: list[str] = Field(default_factory=list)
+    portfolio_transition_summary: str = ""
+    board_shift_summary: str = ""
+    portfolio_constraint_level: str = "normal"
+    portfolio_constraint_note: str = ""
+    data_quality_level: str = "normal"
+    data_quality_note: str = ""
+    data_quality_checks: list[str] = Field(default_factory=list)
     review_status: str = "pending"
     warnings: list[str] = Field(default_factory=list)
 
@@ -723,6 +764,16 @@ class TrainResponse(BaseModel):
     validation_ic: float
     validation_directional_accuracy: float
     comparison: list[ModelCompareItem] = []
+
+
+class TrainJobResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    error: str = ""
+    result: TrainResponse | None = None
 
 
 class UpdateResponse(BaseModel):

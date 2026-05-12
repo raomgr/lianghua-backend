@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 
 from app.config import get_settings
@@ -217,6 +219,20 @@ class MarketService:
                     merged.append({"symbol": item.symbol, "name": item.name})
                     seen.add(item.symbol)
 
+        if len(merged) < limit and self.settings.data_provider.lower() == "tushare":
+            try:
+                provider = self._get_provider()
+                for item in provider.search_universe(normalized, limit=limit * 3):
+                    if item.symbol not in seen:
+                        merged.append({"symbol": item.symbol, "name": item.name})
+                        seen.add(item.symbol)
+                    if len(merged) >= limit:
+                        break
+            except Exception:
+                # Universe search should stay usable even if the upstream
+                # catalog query is temporarily unavailable or rate limited.
+                pass
+
         return merged[:limit]
 
     def _load_names(self) -> dict[str, str]:
@@ -283,6 +299,11 @@ class MarketService:
         top_n = int(daily_settings["top_n"]) if daily_settings else 3
         capital_fraction = float(daily_settings["capital_fraction"]) if daily_settings else 0.95
         max_position_weight = float(daily_settings["max_position_weight"]) if daily_settings else 0.35
+        min_cash_buffer_ratio = float(daily_settings["min_cash_buffer_ratio"]) if daily_settings else 0.05
+        max_turnover_ratio = float(daily_settings["max_turnover_ratio"]) if daily_settings else 1.0
+        min_signal_return_pct = float(daily_settings["min_signal_return_pct"]) if daily_settings else 0.01
+        min_liquidity_amount = float(daily_settings["min_liquidity_amount"]) if daily_settings else 30_000_000.0
+        min_turnover_rate = float(daily_settings["min_turnover_rate"]) if daily_settings else 0.002
 
         predictions = self.repo.load_latest_predictions(
             limit=max(int(candidate_limit), top_n),
@@ -293,6 +314,21 @@ class MarketService:
         current_symbols = [str(item["symbol"]) for item in current_positions]
         relevant_symbols = sorted(set([*current_symbols, *[str(item["symbol"]) for item in predictions]]))
         price_map = self.repo.load_latest_prices(relevant_symbols, provider=active_provider)
+        latest_bar_map: dict[str, dict] = {}
+        for symbol in relevant_symbols:
+            bars = self.repo.load_symbol_history(symbol, limit=3, provider=active_provider)
+            if bars.empty:
+                continue
+            latest = bars.iloc[-1]
+            previous = bars.iloc[-2] if len(bars) > 1 else latest
+            prev_close = float(previous.get("close", 0.0) or 0.0)
+            latest_close = float(latest.get("close", 0.0) or 0.0)
+            latest_bar_map[symbol] = {
+                "change_pct": (latest_close / prev_close - 1.0) if prev_close > 0 else 0.0,
+                "volume": float(latest.get("volume", 0.0) or 0.0),
+                "amount": float(latest.get("amount", 0.0) or 0.0),
+                "turnover_rate": float(latest.get("turnover_rate", 0.0) or 0.0),
+            }
         if price_map:
             self.repo.refresh_paper_position_prices(price_map, account_id=DEFAULT_SIGNAL_ACCOUNT_ID)
             current_positions = self.repo.load_paper_positions(account_id=DEFAULT_SIGNAL_ACCOUNT_ID)
@@ -317,6 +353,51 @@ class MarketService:
         equity = float(cash + market_value)
         target_weight = min(max_position_weight, capital_fraction / max(top_n, 1))
         target_value = equity * target_weight if equity > 0 else 0.0
+
+        skipped_target_signals: list[str] = []
+
+        def is_symbol_hard_restricted(symbol: str, name: str) -> tuple[bool, str]:
+            latest_bar = latest_bar_map.get(symbol, {})
+            latest_volume = float(latest_bar.get("volume", 0.0) or 0.0)
+            latest_amount = float(latest_bar.get("amount", 0.0) or 0.0)
+            latest_price = float(price_map.get(symbol, 0.0) or 0.0)
+            latest_change_pct = float(latest_bar.get("change_pct", 0.0) or 0.0)
+            latest_turnover_rate = float(latest_bar.get("turnover_rate", 0.0) or 0.0)
+            upper_name = name.upper()
+            if "ST" in upper_name or "退" in name:
+                return True, "存在 ST/退市风险"
+            if latest_price <= 0:
+                return True, "缺少可靠最新价"
+            if latest_volume <= 0 or latest_amount <= 0:
+                return True, "疑似停牌或当日无成交"
+            if latest_change_pct >= 0.095:
+                return True, f"接近涨停 {latest_change_pct:.2%}"
+            if latest_amount < min_liquidity_amount and latest_turnover_rate < min_turnover_rate:
+                return True, f"流动性不足（成交额 {latest_amount / 10_000:.0f} 万，换手率 {latest_turnover_rate:.2%}）"
+            return False, ""
+
+        filtered_predictions = []
+        for item in predictions:
+            symbol = str(item["symbol"])
+            name = str(item["name"])
+            blocked, reason = is_symbol_hard_restricted(symbol, name)
+            if blocked:
+                skipped_target_signals.append(f"{symbol} {name}：{reason}")
+                continue
+            filtered_predictions.append(item)
+        predictions = filtered_predictions
+        if not predictions:
+            return {
+                "summary": {
+                    "configured_provider": self.settings.data_provider,
+                    "active_provider": active_provider,
+                    "warnings": ["当前信号候选都被盘前约束过滤，请检查行情状态或放宽股票池。", *skipped_target_signals[:5]],
+                },
+                "review": {"model_run_id": int(latest_run["id"]), "status": "pending", "note": "", "updated_at": ""},
+                "action_items": [],
+                "target_positions": [],
+                "top_candidates": [],
+            }
 
         suggestions: list[dict] = []
         target_rows: list[dict] = []
@@ -416,7 +497,7 @@ class MarketService:
         ) -> str:
             if price <= 0:
                 return "当前缺少可靠价格，执行前请先核对最新行情。"
-            if action in {"买入", "加仓"} and predicted_return < 0.01:
+            if action in {"买入", "加仓"} and predicted_return < min_signal_return_pct:
                 return "预期收益边际不高，若盘中走势偏弱，可以适当降低优先级。"
             if action == "卖出" and current_quantity <= 0:
                 return "当前仓位为空，确认是否已有场外处理。"
@@ -424,22 +505,163 @@ class MarketService:
                 return "这是新增开仓信号，优先确认是否符合你今天的风险预算。"
             return "执行前结合盘中流动性、涨跌幅和你自己的仓位约束再做最终确认。"
 
+        def build_pretrade_constraint(
+            *,
+            action: str,
+            current_quantity: int,
+            target_quantity: int,
+            sellable_quantity: int,
+            buy_locked_quantity: int,
+            price: float,
+            predicted_return: float,
+            latest_change_pct: float,
+            latest_amount: float,
+            latest_turnover_rate: float,
+        ) -> tuple[str, str, list[str], int]:
+            flags: list[str] = []
+            executable_quantity = max(abs(int(target_quantity) - int(current_quantity)), 0)
+            if price <= 0:
+                return (
+                    "blocked",
+                    "缺少可靠最新价，先刷新行情后再决定是否执行。",
+                    ["缺少最新价格"],
+                    0,
+                )
+
+            def amount_brief(value: float) -> str:
+                if value >= 100_000_000:
+                    return f"{value / 100_000_000:.2f} 亿"
+                if value >= 10_000:
+                    return f"{value / 10_000:.0f} 万"
+                return f"{value:.0f}"
+
+            if action in {"卖出", "减仓"}:
+                executable_quantity = min(executable_quantity or current_quantity, max(sellable_quantity, 0))
+                if buy_locked_quantity > 0:
+                    flags.append(f"T+1 锁定 {buy_locked_quantity} 股")
+                if latest_change_pct <= -0.095:
+                    flags.append(f"接近跌停 {latest_change_pct:.2%}")
+                    return (
+                        "blocked",
+                        "该股票今日接近跌停，卖出成交不确定，建议盘中确认是否可执行。",
+                        flags,
+                        executable_quantity,
+                    )
+                if executable_quantity <= 0:
+                    return (
+                        "blocked",
+                        "当前可卖数量为 0，今天不能按信号卖出，需等锁定仓位解锁。",
+                        flags or ["可卖数量为 0"],
+                        0,
+                    )
+                if executable_quantity < max(abs(int(target_quantity) - int(current_quantity)), 0):
+                    flags.append(f"今日最多可卖 {executable_quantity} 股")
+                    return (
+                        "warning",
+                        f"受 T+1 或可卖数量限制，今天最多只能卖出 {executable_quantity} 股。",
+                        flags,
+                        executable_quantity,
+                    )
+                if latest_amount > 0 and latest_amount < min_liquidity_amount:
+                    flags.append(f"成交额偏低 {amount_brief(latest_amount)}")
+                if latest_turnover_rate > 0 and latest_turnover_rate < min_turnover_rate:
+                    flags.append(f"换手率偏低 {latest_turnover_rate:.2%}")
+                if len(flags) > 0 and flags != [f"当前可卖 {sellable_quantity} 股，可按计划执行卖出动作。"]:
+                    return (
+                        "warning",
+                        f"卖出侧存在盘前约束，当前可卖 {sellable_quantity} 股，建议结合流动性再确认。",
+                        flags,
+                        executable_quantity,
+                    )
+                return (
+                    "normal",
+                    f"当前可卖 {sellable_quantity} 股，可按计划执行卖出动作。",
+                    flags or ["可按正常流程卖出"],
+                    executable_quantity,
+                )
+
+            if action in {"买入", "加仓"}:
+                if current_quantity == 0:
+                    flags.append("新增开仓")
+                if latest_change_pct >= 0.095:
+                    flags.append(f"接近涨停 {latest_change_pct:.2%}")
+                    return (
+                        "blocked",
+                        "该股票今日接近涨停，买入成交不确定，建议暂时跳过或等盘中确认。",
+                        flags,
+                        executable_quantity,
+                    )
+                if latest_change_pct >= 0.07:
+                    flags.append(f"涨幅较大 {latest_change_pct:.2%}")
+                if latest_amount > 0 and latest_amount < min_liquidity_amount:
+                    flags.append(f"成交额偏低 {amount_brief(latest_amount)}")
+                if latest_turnover_rate > 0 and latest_turnover_rate < min_turnover_rate:
+                    flags.append(f"换手率偏低 {latest_turnover_rate:.2%}")
+                if predicted_return < min_signal_return_pct:
+                    flags.append("预期收益边际较低")
+                    return (
+                        "warning",
+                        "这是低边际收益买入信号，建议只在仓位和风险预算允许时执行。",
+                        flags,
+                        executable_quantity,
+                    )
+                if len(flags) > (1 if "新增开仓" in flags else 0):
+                    return (
+                        "warning",
+                        "买入侧存在盘前约束，建议先确认流动性和盘中涨幅，再决定是否执行。",
+                        flags,
+                        executable_quantity,
+                    )
+                return (
+                    "normal",
+                    "买入侧没有持仓约束，可结合资金和盘中流动性正常执行。",
+                    flags or ["可按正常流程买入"],
+                    executable_quantity,
+                )
+
+            return (
+                "normal",
+                "当前仓位与目标仓位接近，无需额外处理。",
+                ["无需动作"],
+                0,
+            )
+
         def build_target_quantity(price: float) -> int:
             if price <= 0:
                 return 0
             raw_quantity = int(target_value / price)
             return max((raw_quantity // 100) * 100, 0)
 
+        eligible_predictions: list[dict] = []
+        for item in predictions:
+            symbol = str(item["symbol"])
+            name = str(item["name"])
+            restricted, reason = is_symbol_hard_restricted(symbol, name)
+            if restricted:
+                skipped_target_signals.append(f"{symbol} {name}：{reason}")
+                continue
+            if float(item["predicted_return_5d"]) < min_signal_return_pct:
+                skipped_target_signals.append(
+                    f"{symbol} {name}：预期收益 {float(item['predicted_return_5d']):.2%} 低于筛选阈值 {min_signal_return_pct:.2%}"
+                )
+                continue
+            eligible_predictions.append(item)
+            if len(eligible_predictions) >= top_n:
+                break
+
         rank_index_by_symbol = {
             str(item["symbol"]): index
-            for index, item in enumerate(predictions[:top_n])
+            for index, item in enumerate(eligible_predictions)
         }
 
-        for item in predictions[:top_n]:
+        for item in eligible_predictions:
             symbol = str(item["symbol"])
             current = current_position_map.get(symbol)
             price = float(price_map.get(symbol, current.get("last_price", 0.0) if current else 0.0) or 0.0)
+            latest_bar = latest_bar_map.get(symbol, {})
             current_quantity = int(current["quantity"]) if current else 0
+            sellable_quantity = int(current.get("sellable_quantity", current_quantity)) if current else 0
+            buy_locked_quantity = int(current.get("buy_locked_quantity", 0)) if current else 0
             current_value = float(current_quantity * price)
             current_weight = float(current_value / equity) if equity > 0 else 0.0
             target_quantity = build_target_quantity(price)
@@ -455,6 +677,18 @@ class MarketService:
             elif delta_quantity < 0:
                 action = "减仓"
                 note = "当前仓位高于建议目标仓位。"
+            constraint_level, execution_constraint, pretrade_flags, executable_quantity = build_pretrade_constraint(
+                action=action,
+                current_quantity=current_quantity,
+                target_quantity=target_quantity,
+                sellable_quantity=sellable_quantity,
+                buy_locked_quantity=buy_locked_quantity,
+                price=price,
+                predicted_return=float(item["predicted_return_5d"]),
+                latest_change_pct=float(latest_bar.get("change_pct", 0.0) or 0.0),
+                latest_amount=float(latest_bar.get("amount", 0.0) or 0.0),
+                latest_turnover_rate=float(latest_bar.get("turnover_rate", 0.0) or 0.0),
+            )
             target_row = {
                 "symbol": symbol,
                 "name": str(item["name"]),
@@ -492,6 +726,12 @@ class MarketService:
                         predicted_return=float(item["predicted_return_5d"]),
                         current_quantity=current_quantity,
                     ),
+                    "sellable_quantity": sellable_quantity,
+                    "buy_locked_quantity": buy_locked_quantity,
+                    "executable_quantity": executable_quantity,
+                    "constraint_level": constraint_level,
+                    "execution_constraint": execution_constraint,
+                    "pretrade_flags": pretrade_flags,
                 }
             target_rows.append(target_row)
             suggestions.append(target_row)
@@ -501,9 +741,24 @@ class MarketService:
             if symbol in target_symbols:
                 continue
             price = float(item["last_price"])
+            latest_bar = latest_bar_map.get(symbol, {})
             current_quantity = int(item["quantity"])
+            sellable_quantity = int(item.get("sellable_quantity", current_quantity))
+            buy_locked_quantity = int(item.get("buy_locked_quantity", 0))
             current_value = float(current_quantity * price)
             current_weight = float(current_value / equity) if equity > 0 else 0.0
+            constraint_level, execution_constraint, pretrade_flags, executable_quantity = build_pretrade_constraint(
+                action="卖出",
+                current_quantity=current_quantity,
+                target_quantity=0,
+                sellable_quantity=sellable_quantity,
+                buy_locked_quantity=buy_locked_quantity,
+                price=price,
+                predicted_return=0.0,
+                latest_change_pct=float(latest_bar.get("change_pct", 0.0) or 0.0),
+                latest_amount=float(latest_bar.get("amount", 0.0) or 0.0),
+                latest_turnover_rate=float(latest_bar.get("turnover_rate", 0.0) or 0.0),
+            )
             suggestions.append(
                 {
                     "symbol": symbol,
@@ -542,6 +797,12 @@ class MarketService:
                         predicted_return=0.0,
                         current_quantity=current_quantity,
                     ),
+                    "sellable_quantity": sellable_quantity,
+                    "buy_locked_quantity": buy_locked_quantity,
+                    "executable_quantity": executable_quantity,
+                    "constraint_level": constraint_level,
+                    "execution_constraint": execution_constraint,
+                    "pretrade_flags": pretrade_flags,
                 }
             )
 
@@ -608,12 +869,238 @@ class MarketService:
             warnings.append(str(status["notes"]))
         if review["status"] == "pending":
             warnings.append("这次信号还没有被你标记为已执行或已忽略。")
+        if skipped_target_signals:
+            preview = "；".join(skipped_target_signals[:3])
+            suffix = " 等更多样本" if len(skipped_target_signals) > 3 else ""
+            warnings.append(f"已有 {len(skipped_target_signals)} 只候选因盘前约束被跳过：{preview}{suffix}。")
 
         avg_return = (
             float(sum(float(item["predicted_return_5d"]) for item in predictions[:top_n]) / len(predictions[:top_n]))
             if predictions[:top_n]
             else 0.0
         )
+
+        planned_buy_amount = round(
+            sum(
+                max(int(item.get("delta_quantity", 0)), 0) * float(item.get("last_price", 0.0) or 0.0)
+                for item in suggestions
+                if item["action"] in {"买入", "加仓"}
+            ),
+            2,
+        )
+        planned_sell_amount = round(
+            sum(
+                abs(min(int(item.get("delta_quantity", 0)), 0)) * float(item.get("last_price", 0.0) or 0.0)
+                for item in suggestions
+                if item["action"] in {"卖出", "减仓"}
+            ),
+            2,
+        )
+        estimated_cash_after_signal = round(cash + planned_sell_amount - planned_buy_amount, 2)
+        min_cash_buffer_required = round(equity * min_cash_buffer_ratio, 2)
+        estimated_turnover_ratio = (
+            round((planned_buy_amount + planned_sell_amount) / equity, 4) if equity > 0 else 0.0
+        )
+        new_position_count = sum(1 for item in suggestions if item["action"] == "买入")
+        exit_position_count = sum(1 for item in suggestions if item["action"] == "卖出")
+        target_utilization_ratio = round((len(target_rows) / top_n), 4) if top_n > 0 else 0.0
+        target_weights = [
+            float(item.get("target_weight", 0.0) or 0.0)
+            for item in target_rows
+            if float(item.get("target_weight", 0.0) or 0.0) > 0
+        ]
+        sorted_target_weights = sorted(target_weights, reverse=True)
+        max_target_position_weight = round(sorted_target_weights[0], 4) if sorted_target_weights else 0.0
+        top_two_target_weight_share = round(sum(sorted_target_weights[:2]), 4) if sorted_target_weights else 0.0
+        effective_holding_count = (
+            round(1 / sum(weight * weight for weight in target_weights), 2)
+            if target_weights and sum(weight * weight for weight in target_weights) > 0
+            else 0.0
+        )
+        def classify_board_bucket(symbol: str) -> str:
+            if symbol.startswith(("688", "689")):
+                return "科创板"
+            if symbol.startswith(("300", "301")):
+                return "创业板"
+            if symbol.startswith(("8", "4", "92")):
+                return "北交所"
+            if symbol.startswith(("600", "601", "603", "605")):
+                return "沪主板"
+            if symbol.startswith(("000", "001", "002", "003")):
+                return "深主板"
+            return "其他"
+
+        def format_board_exposure(board_weights: dict[str, float]) -> list[str]:
+            return [
+                f"{name} {share:.0%}"
+                for name, share in sorted(board_weights.items(), key=lambda pair: pair[1], reverse=True)
+                if share > 0
+            ]
+
+        board_weights: dict[str, float] = {}
+        for item in target_rows:
+            weight = float(item.get("target_weight", 0.0) or 0.0)
+            if weight <= 0:
+                continue
+            bucket = classify_board_bucket(str(item.get("symbol", "")))
+            board_weights[bucket] = board_weights.get(bucket, 0.0) + weight
+
+        current_board_weights: dict[str, float] = {}
+        for item in position_rows:
+            quantity = int(item.get("quantity", 0) or 0)
+            if quantity <= 0:
+                continue
+            current_value = float(quantity) * float(item.get("last_price", 0.0) or 0.0)
+            if equity <= 0 or current_value <= 0:
+                continue
+            bucket = classify_board_bucket(str(item.get("symbol", "")))
+            current_board_weights[bucket] = current_board_weights.get(bucket, 0.0) + (current_value / equity)
+
+        sorted_board_weights = sorted(board_weights.items(), key=lambda pair: pair[1], reverse=True)
+        sorted_current_board_weights = sorted(current_board_weights.items(), key=lambda pair: pair[1], reverse=True)
+        dominant_board_bucket = sorted_board_weights[0][0] if sorted_board_weights else ""
+        dominant_board_share = round(sorted_board_weights[0][1], 4) if sorted_board_weights else 0.0
+        board_exposure_breakdown = format_board_exposure(board_weights)
+        current_board_exposure_breakdown = format_board_exposure(current_board_weights)
+
+        top_entry_targets = [
+            item for item in target_rows if str(item.get("action", "")) in {"买入", "加仓"}
+        ]
+        top_exit_positions = [
+            item for item in suggestions if str(item.get("action", "")) == "卖出"
+        ]
+        entry_brief = "、".join(f"{item['symbol']} {item['name']}" for item in top_entry_targets[:3])
+        exit_brief = "、".join(f"{item['symbol']} {item['name']}" for item in top_exit_positions[:3])
+        portfolio_transition_summary = (
+            f"本次计划退出 {exit_position_count} 只，新增 {new_position_count} 只，目标持仓维持 {len(target_rows)} 只。"
+        )
+        if exit_brief or entry_brief:
+            transition_parts = [portfolio_transition_summary]
+            if exit_brief:
+                transition_parts.append(f"主要退出：{exit_brief}")
+            if entry_brief:
+                transition_parts.append(f"优先换入：{entry_brief}")
+            portfolio_transition_summary = "；".join(transition_parts) + "。"
+
+        before_top = sorted_current_board_weights[0] if sorted_current_board_weights else None
+        after_top = sorted_board_weights[0] if sorted_board_weights else None
+        if before_top and after_top:
+            if before_top[0] == after_top[0]:
+                board_shift_summary = (
+                    f"主暴露板块仍为 {after_top[0]}，占比从 {before_top[1]:.0%} 变化到 {after_top[1]:.0%}。"
+                )
+            else:
+                board_shift_summary = (
+                    f"主暴露板块由 {before_top[0]} {before_top[1]:.0%} 切换到 {after_top[0]} {after_top[1]:.0%}。"
+                )
+        elif after_top:
+            board_shift_summary = f"执行后组合主要暴露在 {after_top[0]}，占比约 {after_top[1]:.0%}。"
+        elif before_top:
+            board_shift_summary = f"当前组合主要暴露在 {before_top[0]}，占比约 {before_top[1]:.0%}。"
+        else:
+            board_shift_summary = "当前没有足够的持仓暴露数据。"
+
+        portfolio_constraint_level = "normal"
+        portfolio_constraint_note = "组合层风险约束正常。"
+        if estimated_cash_after_signal < min_cash_buffer_required:
+            portfolio_constraint_level = "warning"
+            portfolio_constraint_note = (
+                f"执行后预计现金 {estimated_cash_after_signal:,.0f}，低于最低缓冲 {min_cash_buffer_required:,.0f}。"
+            )
+            warnings.append(portfolio_constraint_note)
+        elif estimated_turnover_ratio > max_turnover_ratio:
+            portfolio_constraint_level = "warning"
+            portfolio_constraint_note = (
+                f"预计换手率 {estimated_turnover_ratio:.0%}，高于上限 {max_turnover_ratio:.0%}。"
+            )
+            warnings.append(portfolio_constraint_note)
+        elif target_utilization_ratio < 0.8:
+            portfolio_constraint_level = "warning"
+            portfolio_constraint_note = (
+                f"目标仓位只完成 {target_utilization_ratio:.0%}，当前候选经过滤后不足，组合分散度偏低。"
+            )
+            warnings.append(portfolio_constraint_note)
+        elif top_two_target_weight_share >= 0.6 and effective_holding_count < max(float(top_n - 1), 2.5):
+            portfolio_constraint_level = "warning"
+            portfolio_constraint_note = (
+                f"前两大目标持仓占比 {top_two_target_weight_share:.0%}，有效持仓约 {effective_holding_count:.2f} 只，组合集中度偏高。"
+            )
+            warnings.append(portfolio_constraint_note)
+        elif dominant_board_share >= 0.8 and dominant_board_bucket:
+            portfolio_constraint_level = "warning"
+            portfolio_constraint_note = (
+                f"{dominant_board_bucket} 占目标组合 {dominant_board_share:.0%}，板块暴露过于集中。"
+            )
+            warnings.append(portfolio_constraint_note)
+        elif estimated_turnover_ratio > max_turnover_ratio * 0.8:
+            portfolio_constraint_note = (
+                f"预计换手率 {estimated_turnover_ratio:.0%}，接近上限 {max_turnover_ratio:.0%}。"
+            )
+        elif new_position_count >= max(top_n - 1, 2):
+            portfolio_constraint_note = (
+                f"本次预计新增 {new_position_count} 只、退出 {exit_position_count} 只，组合变化较大，建议加强人工复核。"
+            )
+        elif top_two_target_weight_share >= 0.55:
+            portfolio_constraint_note = (
+                f"前两大目标持仓占比 {top_two_target_weight_share:.0%}，有效持仓约 {effective_holding_count:.2f} 只，建议关注组合集中度。"
+            )
+        elif dominant_board_share >= 0.65 and dominant_board_bucket:
+            portfolio_constraint_note = (
+                f"{dominant_board_bucket} 占目标组合 {dominant_board_share:.0%}，建议关注板块暴露是否过于集中。"
+            )
+
+        data_quality_level = "normal"
+        data_quality_note = "最近同步和信号生成状态正常。"
+        data_quality_checks: list[str] = []
+        last_sync_at = str(status.get("last_sync_at", "") or "")
+        signal_trade_date = str(predictions[0]["trade_date"]) if predictions else ""
+        universe_size = int(status.get("universe_size", 0) or 0)
+        total_bars = int(status.get("total_bars", 0) or 0)
+        bars_per_symbol = round((total_bars / universe_size), 1) if universe_size > 0 else 0.0
+
+        if not last_sync_at:
+            data_quality_level = "warning"
+            data_quality_note = "尚未记录最近同步时间，请先确认数据是否已经手动刷新。"
+            data_quality_checks.append("最近同步时间缺失")
+        else:
+            try:
+                sync_date = datetime.fromisoformat(last_sync_at).date().isoformat()
+                if signal_trade_date and sync_date < signal_trade_date:
+                    data_quality_level = "warning"
+                    data_quality_note = f"最近同步日期 {sync_date} 早于信号交易日 {signal_trade_date}，请确认数据是否已更新。"
+                    data_quality_checks.append("同步日期早于信号交易日")
+            except ValueError:
+                data_quality_checks.append("最近同步时间格式异常")
+
+        if universe_size <= 0:
+            data_quality_level = "warning"
+            data_quality_note = "当前股票池为空，信号和训练结果可能不完整。"
+            data_quality_checks.append("股票池为空")
+        elif universe_size < top_n:
+            data_quality_level = "warning"
+            data_quality_note = f"当前股票池只有 {universe_size} 只，低于目标持仓数 {top_n}。"
+            data_quality_checks.append("股票池规模不足")
+
+        if total_bars <= 0:
+            data_quality_level = "warning"
+            data_quality_note = "历史K线为空，当前信号缺少可靠行情基础。"
+            data_quality_checks.append("历史K线为空")
+        elif bars_per_symbol < 60:
+            data_quality_level = "warning"
+            data_quality_note = f"平均每只股票仅有 {bars_per_symbol:.0f} 条K线，历史样本偏浅。"
+            data_quality_checks.append("历史样本偏浅")
+
+        if len(predictions) < top_n:
+            data_quality_level = "warning"
+            data_quality_note = f"当前仅生成 {len(predictions)} 只候选，低于目标持仓数 {top_n}。"
+            data_quality_checks.append("候选数量不足")
+
+        if status.get("active_data_provider") != status.get("provider"):
+            if data_quality_level == "normal":
+                data_quality_note = (
+                    f"当前使用 {status.get('active_data_provider')} 数据，和配置数据源 {status.get('provider')} 不一致。"
+                )
+            data_quality_checks.append("数据源已回退")
 
         enriched_candidates = []
         for item in predictions:
@@ -647,6 +1134,29 @@ class MarketService:
                 "target_weight_per_position": target_weight,
                 "avg_predicted_return_5d": avg_return,
                 "estimated_turnover_count": sum(1 for item in suggestions if item["action"] != "持有"),
+                "planned_buy_amount": planned_buy_amount,
+                "planned_sell_amount": planned_sell_amount,
+                "estimated_cash_after_signal": estimated_cash_after_signal,
+                "min_cash_buffer_required": min_cash_buffer_required,
+                "estimated_turnover_ratio": estimated_turnover_ratio,
+                "max_turnover_ratio": max_turnover_ratio,
+                "target_utilization_ratio": target_utilization_ratio,
+                "new_position_count": new_position_count,
+                "exit_position_count": exit_position_count,
+                "max_target_position_weight": max_target_position_weight,
+                "top_two_target_weight_share": top_two_target_weight_share,
+                "effective_holding_count": effective_holding_count,
+                "current_board_exposure_breakdown": current_board_exposure_breakdown,
+                "dominant_board_bucket": dominant_board_bucket,
+                "dominant_board_share": dominant_board_share,
+                "board_exposure_breakdown": board_exposure_breakdown,
+                "portfolio_transition_summary": portfolio_transition_summary,
+                "board_shift_summary": board_shift_summary,
+                "portfolio_constraint_level": portfolio_constraint_level,
+                "portfolio_constraint_note": portfolio_constraint_note,
+                "data_quality_level": data_quality_level,
+                "data_quality_note": data_quality_note,
+                "data_quality_checks": data_quality_checks,
                 "review_status": str(review["status"]),
                 "warnings": warnings,
             },

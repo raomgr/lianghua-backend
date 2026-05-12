@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
+from time import time
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,7 @@ def _load_catalog() -> list[UniverseItem]:
 
 
 COMMON_A_SHARE_CATALOG = _load_catalog()
+_TUSHARE_STOCK_BASIC_CACHE: dict[str, object] = {"loaded_at": 0.0, "items": []}
 
 
 class BaseProvider:
@@ -71,6 +73,9 @@ class BaseProvider:
                 }
             )
         return pd.DataFrame(frames)
+
+    def search_universe(self, query_text: str, limit: int = 12) -> list[UniverseItem]:
+        return []
 
 
 def _symbol_to_ts_code(symbol: str) -> str:
@@ -272,6 +277,57 @@ class TushareProvider(BaseProvider):
 
     def get_universe(self) -> list[UniverseItem]:
         return self._get_basic_universe()
+
+    def _load_stock_basic_catalog(self) -> list[UniverseItem]:
+        loaded_at = float(_TUSHARE_STOCK_BASIC_CACHE.get("loaded_at", 0.0) or 0.0)
+        cached_items = _TUSHARE_STOCK_BASIC_CACHE.get("items", [])
+        if cached_items and (time() - loaded_at) < 12 * 60 * 60:
+            return list(cached_items)
+
+        frame = self.pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="symbol,name",
+        )
+        if frame is None or frame.empty:
+            return []
+
+        items = [
+            UniverseItem(symbol=str(row["symbol"]).zfill(6), name=str(row["name"]).strip())
+            for _, row in frame.iterrows()
+            if row.get("symbol") and row.get("name")
+        ]
+        _TUSHARE_STOCK_BASIC_CACHE["loaded_at"] = time()
+        _TUSHARE_STOCK_BASIC_CACHE["items"] = items
+        return list(items)
+
+    def search_universe(self, query_text: str, limit: int = 12) -> list[UniverseItem]:
+        normalized = query_text.strip().lower()
+        if not normalized:
+            return []
+
+        items = self._load_stock_basic_catalog()
+        if not items:
+            return []
+
+        def match_score(item: UniverseItem) -> tuple[int, str]:
+            symbol = item.symbol.lower()
+            name = item.name.lower()
+            if symbol == normalized or name == normalized:
+                return (0, item.symbol)
+            if symbol.startswith(normalized):
+                return (1, item.symbol)
+            if name.startswith(normalized):
+                return (2, item.symbol)
+            if normalized in symbol:
+                return (3, item.symbol)
+            if normalized in name:
+                return (4, item.symbol)
+            return (99, item.symbol)
+
+        matched = [item for item in items if normalized in item.symbol.lower() or normalized in item.name.lower()]
+        matched.sort(key=match_score)
+        return matched[:limit]
 
     def get_daily_bars(self, symbol: str, limit: int = 120) -> pd.DataFrame:
         end = datetime.today()

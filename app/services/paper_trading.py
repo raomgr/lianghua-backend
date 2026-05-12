@@ -25,6 +25,9 @@ class PaperRebalanceConfig:
     fill_ratio: float = 1.0
     max_drawdown_limit: float = 0.18
     max_equity_change_limit: float = 0.04
+    min_signal_return_pct: float = 0.01
+    min_liquidity_amount: float = 30_000_000.0
+    min_turnover_rate: float = 0.002
 
 
 class PaperTradingService:
@@ -225,6 +228,9 @@ class PaperTradingService:
         fill_ratio: float,
         max_drawdown_limit: float,
         max_equity_change_limit: float,
+        min_signal_return_pct: float,
+        min_liquidity_amount: float,
+        min_turnover_rate: float,
     ) -> dict:
         normalized = self.repo.update_paper_daily_settings(
             account_id=DEFAULT_ACCOUNT_ID,
@@ -243,6 +249,9 @@ class PaperTradingService:
             fill_ratio=max(0.0, min(float(fill_ratio), 1.0)),
             max_drawdown_limit=max(0.0, min(float(max_drawdown_limit), 0.8)),
             max_equity_change_limit=max(0.0, min(float(max_equity_change_limit), 0.5)),
+            min_signal_return_pct=max(0.0, min(float(min_signal_return_pct), 0.2)),
+            min_liquidity_amount=max(0.0, float(min_liquidity_amount)),
+            min_turnover_rate=max(0.0, min(float(min_turnover_rate), 0.1)),
         )
         snapshot = self.get_account_snapshot()
         snapshot["daily_settings"] = normalized
@@ -454,6 +463,9 @@ class PaperTradingService:
         fill_ratio: float = 1.0,
         max_drawdown_limit: float = 0.18,
         max_equity_change_limit: float = 0.04,
+        min_signal_return_pct: float = 0.01,
+        min_liquidity_amount: float = 30_000_000.0,
+        min_turnover_rate: float = 0.002,
     ) -> dict:
         self.repo.unlock_paper_t1_positions(account_id=DEFAULT_ACCOUNT_ID, today=self._current_trade_date())
         account = self.repo.load_paper_account(account_id=DEFAULT_ACCOUNT_ID)
@@ -469,6 +481,9 @@ class PaperTradingService:
             fill_ratio=max(0.0, min(float(fill_ratio), 1.0)),
             max_drawdown_limit=max(0.0, min(float(max_drawdown_limit), 0.8)),
             max_equity_change_limit=max(0.0, min(float(max_equity_change_limit), 0.5)),
+            min_signal_return_pct=max(0.0, min(float(min_signal_return_pct), 0.2)),
+            min_liquidity_amount=max(0.0, float(min_liquidity_amount)),
+            min_turnover_rate=max(0.0, min(float(min_turnover_rate), 0.1)),
         )
         prediction_pool = self.repo.load_latest_predictions(
             limit=max(config.top_n * 3, config.top_n + 10),
@@ -484,6 +499,22 @@ class PaperTradingService:
         signal_pool_symbols = [str(item["symbol"]) for item in prediction_pool]
         relevant_symbols = sorted(set([*signal_pool_symbols, *current_positions.keys()]))
         price_map = self._latest_price_map(relevant_symbols)
+        latest_bar_map: dict[str, dict] = {}
+        provider = resolve_active_provider(self.repo)
+        for symbol in relevant_symbols:
+            bars = self.repo.load_symbol_history(symbol, limit=3, provider=provider)
+            if bars.empty:
+                continue
+            latest = bars.iloc[-1]
+            previous = bars.iloc[-2] if len(bars) > 1 else latest
+            prev_close = float(previous.get("close", 0.0) or 0.0)
+            latest_close = float(latest.get("close", 0.0) or 0.0)
+            latest_bar_map[symbol] = {
+                "change_pct": (latest_close / prev_close - 1.0) if prev_close > 0 else 0.0,
+                "volume": float(latest.get("volume", 0.0) or 0.0),
+                "amount": float(latest.get("amount", 0.0) or 0.0),
+                "turnover_rate": float(latest.get("turnover_rate", 0.0) or 0.0),
+            }
         missing = [symbol for symbol in signal_pool_symbols[: config.top_n] if symbol not in price_map]
         if missing:
             raise RuntimeError(f"缺少这些股票的最新价格，无法执行模拟调仓：{', '.join(missing)}")
@@ -506,9 +537,41 @@ class PaperTradingService:
                 locked_position_reasons[symbol] = f"T+1 lock: {buy_locked_quantity} shares are not sellable today."
 
         predictions = []
+        filtered_signal_notes: list[str] = []
         for item in prediction_pool:
             symbol = str(item["symbol"])
+            name = str(item["name"])
             if symbol in forced_exit_reasons:
+                continue
+            latest_bar = latest_bar_map.get(symbol, {})
+            latest_price = float(price_map.get(symbol, 0.0) or 0.0)
+            latest_volume = float(latest_bar.get("volume", 0.0) or 0.0)
+            latest_amount = float(latest_bar.get("amount", 0.0) or 0.0)
+            latest_turnover_rate = float(latest_bar.get("turnover_rate", 0.0) or 0.0)
+            latest_change_pct = float(latest_bar.get("change_pct", 0.0) or 0.0)
+            predicted_return = float(item.get("predicted_return_5d", 0.0) or 0.0)
+            upper_name = name.upper()
+            if "ST" in upper_name or "退" in name:
+                filtered_signal_notes.append(f"{symbol} {name}：存在 ST/退市风险")
+                continue
+            if latest_price <= 0:
+                filtered_signal_notes.append(f"{symbol} {name}：缺少可靠最新价")
+                continue
+            if latest_volume <= 0 or latest_amount <= 0:
+                filtered_signal_notes.append(f"{symbol} {name}：疑似停牌或当日无成交")
+                continue
+            if latest_change_pct >= 0.095:
+                filtered_signal_notes.append(f"{symbol} {name}：接近涨停 {latest_change_pct:.2%}")
+                continue
+            if latest_amount < config.min_liquidity_amount and latest_turnover_rate < config.min_turnover_rate:
+                filtered_signal_notes.append(
+                    f"{symbol} {name}：流动性不足（成交额 {latest_amount / 10_000:.0f} 万，换手率 {latest_turnover_rate:.2%}）"
+                )
+                continue
+            if predicted_return < config.min_signal_return_pct:
+                filtered_signal_notes.append(
+                    f"{symbol} {name}：预期收益 {predicted_return:.2%} 低于筛选阈值 {config.min_signal_return_pct:.2%}"
+                )
                 continue
             predictions.append(item)
             if len(predictions) >= config.top_n:
@@ -614,6 +677,10 @@ class PaperTradingService:
             warnings.append(f"本次有 {len(forced_exit_reasons)} 个持仓触发止损/止盈，将被强制调出。")
         if locked_position_reasons:
             warnings.append(f"本次有 {len(locked_position_reasons)} 个持仓存在 T+1 锁定，卖出会受到限制。")
+        if filtered_signal_notes:
+            warnings.extend(filtered_signal_notes[:5])
+            if len(filtered_signal_notes) > 5:
+                warnings.append(f"另有 {len(filtered_signal_notes) - 5} 只候选因筛选阈值被跳过。")
         blocked_by_risk = False
         if risk_metrics["current_drawdown"] >= config.max_drawdown_limit:
             warnings.append(
@@ -698,6 +765,9 @@ class PaperTradingService:
                 "fill_ratio": config.fill_ratio,
                 "max_drawdown_limit": config.max_drawdown_limit,
                 "max_equity_change_limit": config.max_equity_change_limit,
+                "min_signal_return_pct": config.min_signal_return_pct,
+                "min_liquidity_amount": config.min_liquidity_amount,
+                "min_turnover_rate": config.min_turnover_rate,
                 "board_lot": config.board_lot,
             },
             "signals": predictions,
@@ -748,6 +818,9 @@ class PaperTradingService:
         fill_ratio: float = 1.0,
         max_drawdown_limit: float = 0.18,
         max_equity_change_limit: float = 0.04,
+        min_signal_return_pct: float = 0.01,
+        min_liquidity_amount: float = 30_000_000.0,
+        min_turnover_rate: float = 0.002,
     ) -> dict:
         if preview_id is not None:
             existing_plan = self.repo.load_paper_rebalance_plan(preview_id, account_id=DEFAULT_ACCOUNT_ID)
@@ -770,6 +843,9 @@ class PaperTradingService:
             fill_ratio=fill_ratio,
             max_drawdown_limit=max_drawdown_limit,
             max_equity_change_limit=max_equity_change_limit,
+            min_signal_return_pct=min_signal_return_pct,
+            min_liquidity_amount=min_liquidity_amount,
+            min_turnover_rate=min_turnover_rate,
         )
         stored_plan = self.repo.create_paper_rebalance_plan(
             account_id=DEFAULT_ACCOUNT_ID,
@@ -827,6 +903,9 @@ class PaperTradingService:
         fill_ratio: float = 1.0,
         max_drawdown_limit: float = 0.18,
         max_equity_change_limit: float = 0.04,
+        min_signal_return_pct: float = 0.01,
+        min_liquidity_amount: float = 30_000_000.0,
+        min_turnover_rate: float = 0.002,
     ) -> dict:
         self.repo.unlock_paper_t1_positions(account_id=DEFAULT_ACCOUNT_ID, today=self._current_trade_date())
         plan_id: int | None = None
@@ -861,6 +940,9 @@ class PaperTradingService:
                 fill_ratio=fill_ratio,
                 max_drawdown_limit=max_drawdown_limit,
                 max_equity_change_limit=max_equity_change_limit,
+                min_signal_return_pct=min_signal_return_pct,
+                min_liquidity_amount=min_liquidity_amount,
+                min_turnover_rate=min_turnover_rate,
             )
         if plan["summary"]["blocked"]:
             raise RuntimeError("当前调仓计划触发风控限制，请先调整参数或降低风险后再执行。")
