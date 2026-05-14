@@ -14,6 +14,12 @@ class StockSnapshot(BaseModel):
     market: str | None = None
     exchange: str | None = None
     list_date: str | None = None
+    fin_ann_date: str | None = None
+    fin_end_date: str | None = None
+    roe_dt: float | None = None
+    grossprofit_margin: float | None = None
+    debt_to_assets: float | None = None
+    ocfps: float | None = None
     turnover_rate_f: float | None = None
     pe_ttm: float | None = None
     pb: float | None = None
@@ -32,12 +38,22 @@ class PriceBar(BaseModel):
     close: float
     volume: float
     amount: float | None = None
+    adj_factor: float | None = None
+    qfq_open: float | None = None
+    qfq_high: float | None = None
+    qfq_low: float | None = None
+    qfq_close: float | None = None
     turnover_rate: float | None = None
     turnover_rate_f: float | None = None
     pe_ttm: float | None = None
     pb: float | None = None
     total_mv: float | None = None
     circ_mv: float | None = None
+    buy_lg_amount: float | None = None
+    sell_lg_amount: float | None = None
+    buy_elg_amount: float | None = None
+    sell_elg_amount: float | None = None
+    net_mf_amount: float | None = None
 
 
 class FactorResult(BaseModel):
@@ -72,6 +88,10 @@ class MetricPoint(BaseModel):
 
 
 class BacktestSummary(BaseModel):
+    backtest_mode: str = "rule"
+    signal_source: str = "factor-rule"
+    model_name: str | None = None
+    benchmark_name: str = "universe-equal-weight"
     annual_return: float
     annual_volatility: float
     max_drawdown: float
@@ -735,6 +755,7 @@ class SignalHistoryItem(BaseModel):
     review_updated_at: str = ""
     execution_summary: dict = Field(default_factory=dict)
     review_performance: dict = Field(default_factory=dict)
+    signal_outcome: dict = Field(default_factory=dict)
     execution_items: list[dict] = Field(default_factory=list)
 
 

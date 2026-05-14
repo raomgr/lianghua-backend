@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 
@@ -40,6 +40,12 @@ class MarketRepository:
                     market TEXT,
                     exchange TEXT,
                     list_date TEXT,
+                    fin_ann_date TEXT,
+                    fin_end_date TEXT,
+                    roe_dt REAL,
+                    grossprofit_margin REAL,
+                    debt_to_assets REAL,
+                    ocfps REAL,
                     provider TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(symbol, provider)
@@ -63,6 +69,16 @@ class MarketRepository:
                     pb REAL,
                     total_mv REAL,
                     circ_mv REAL,
+                    buy_lg_amount REAL,
+                    sell_lg_amount REAL,
+                    buy_elg_amount REAL,
+                    sell_elg_amount REAL,
+                    net_mf_amount REAL,
+                    adj_factor REAL,
+                    qfq_open REAL,
+                    qfq_high REAL,
+                    qfq_low REAL,
+                    qfq_close REAL,
                     provider TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(symbol, trade_date, provider)
@@ -88,11 +104,27 @@ class MarketRepository:
             self._ensure_column(conn, "daily_bars", "pb", "REAL")
             self._ensure_column(conn, "daily_bars", "total_mv", "REAL")
             self._ensure_column(conn, "daily_bars", "circ_mv", "REAL")
+            self._ensure_column(conn, "daily_bars", "buy_lg_amount", "REAL")
+            self._ensure_column(conn, "daily_bars", "sell_lg_amount", "REAL")
+            self._ensure_column(conn, "daily_bars", "buy_elg_amount", "REAL")
+            self._ensure_column(conn, "daily_bars", "sell_elg_amount", "REAL")
+            self._ensure_column(conn, "daily_bars", "net_mf_amount", "REAL")
+            self._ensure_column(conn, "daily_bars", "adj_factor", "REAL")
+            self._ensure_column(conn, "daily_bars", "qfq_open", "REAL")
+            self._ensure_column(conn, "daily_bars", "qfq_high", "REAL")
+            self._ensure_column(conn, "daily_bars", "qfq_low", "REAL")
+            self._ensure_column(conn, "daily_bars", "qfq_close", "REAL")
             self._ensure_column(conn, "universe", "area", "TEXT")
             self._ensure_column(conn, "universe", "industry", "TEXT")
             self._ensure_column(conn, "universe", "market", "TEXT")
             self._ensure_column(conn, "universe", "exchange", "TEXT")
             self._ensure_column(conn, "universe", "list_date", "TEXT")
+            self._ensure_column(conn, "universe", "fin_ann_date", "TEXT")
+            self._ensure_column(conn, "universe", "fin_end_date", "TEXT")
+            self._ensure_column(conn, "universe", "roe_dt", "REAL")
+            self._ensure_column(conn, "universe", "grossprofit_margin", "REAL")
+            self._ensure_column(conn, "universe", "debt_to_assets", "REAL")
+            self._ensure_column(conn, "universe", "ocfps", "REAL")
             self._migrate_universe_primary_key(conn)
             self._migrate_daily_bars_primary_key(conn)
             conn.execute(
@@ -345,6 +377,12 @@ class MarketRepository:
         market_expr = "market" if "market" in columns else "''"
         exchange_expr = "exchange" if "exchange" in columns else "''"
         list_date_expr = "list_date" if "list_date" in columns else "''"
+        fin_ann_date_expr = "fin_ann_date" if "fin_ann_date" in columns else "''"
+        fin_end_date_expr = "fin_end_date" if "fin_end_date" in columns else "''"
+        roe_dt_expr = "roe_dt" if "roe_dt" in columns else "NULL"
+        grossprofit_margin_expr = "grossprofit_margin" if "grossprofit_margin" in columns else "NULL"
+        debt_to_assets_expr = "debt_to_assets" if "debt_to_assets" in columns else "NULL"
+        ocfps_expr = "ocfps" if "ocfps" in columns else "NULL"
 
         conn.execute(
             """
@@ -356,6 +394,12 @@ class MarketRepository:
                 market TEXT,
                 exchange TEXT,
                 list_date TEXT,
+                fin_ann_date TEXT,
+                fin_end_date TEXT,
+                roe_dt REAL,
+                grossprofit_margin REAL,
+                debt_to_assets REAL,
+                ocfps REAL,
                 provider TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(symbol, provider)
@@ -365,7 +409,11 @@ class MarketRepository:
         conn.execute("DELETE FROM universe_v2")
         conn.execute(
             f"""
-            INSERT INTO universe_v2(symbol, name, area, industry, market, exchange, list_date, provider, updated_at)
+            INSERT INTO universe_v2(
+                symbol, name, area, industry, market, exchange, list_date,
+                fin_ann_date, fin_end_date, roe_dt, grossprofit_margin, debt_to_assets, ocfps,
+                provider, updated_at
+            )
             SELECT
                 symbol,
                 name,
@@ -374,6 +422,12 @@ class MarketRepository:
                 COALESCE({market_expr}, ''),
                 COALESCE({exchange_expr}, ''),
                 COALESCE({list_date_expr}, ''),
+                COALESCE({fin_ann_date_expr}, ''),
+                COALESCE({fin_end_date_expr}, ''),
+                {roe_dt_expr},
+                {grossprofit_margin_expr},
+                {debt_to_assets_expr},
+                {ocfps_expr},
                 provider,
                 updated_at
             FROM universe
@@ -394,6 +448,11 @@ class MarketRepository:
         pb_expr = "pb" if "pb" in columns else "NULL"
         total_mv_expr = "total_mv" if "total_mv" in columns else "NULL"
         circ_mv_expr = "circ_mv" if "circ_mv" in columns else "NULL"
+        buy_lg_amount_expr = "buy_lg_amount" if "buy_lg_amount" in columns else "NULL"
+        sell_lg_amount_expr = "sell_lg_amount" if "sell_lg_amount" in columns else "NULL"
+        buy_elg_amount_expr = "buy_elg_amount" if "buy_elg_amount" in columns else "NULL"
+        sell_elg_amount_expr = "sell_elg_amount" if "sell_elg_amount" in columns else "NULL"
+        net_mf_amount_expr = "net_mf_amount" if "net_mf_amount" in columns else "NULL"
 
         conn.execute(
             """
@@ -412,6 +471,16 @@ class MarketRepository:
                 pb REAL,
                 total_mv REAL,
                 circ_mv REAL,
+                buy_lg_amount REAL,
+                sell_lg_amount REAL,
+                buy_elg_amount REAL,
+                sell_elg_amount REAL,
+                net_mf_amount REAL,
+                adj_factor REAL,
+                qfq_open REAL,
+                qfq_high REAL,
+                qfq_low REAL,
+                qfq_close REAL,
                 provider TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(symbol, trade_date, provider)
@@ -423,7 +492,10 @@ class MarketRepository:
             f"""
             INSERT INTO daily_bars_v2(
                 symbol, trade_date, open, high, low, close, volume, amount, turnover_rate,
-                turnover_rate_f, pe_ttm, pb, total_mv, circ_mv, provider, updated_at
+                turnover_rate_f, pe_ttm, pb, total_mv, circ_mv,
+                buy_lg_amount, sell_lg_amount, buy_elg_amount, sell_elg_amount, net_mf_amount,
+                adj_factor, qfq_open, qfq_high, qfq_low, qfq_close,
+                provider, updated_at
             )
             SELECT
                 symbol,
@@ -440,6 +512,16 @@ class MarketRepository:
                 {pb_expr},
                 {total_mv_expr},
                 {circ_mv_expr},
+                {buy_lg_amount_expr},
+                {sell_lg_amount_expr},
+                {buy_elg_amount_expr},
+                {sell_elg_amount_expr},
+                {net_mf_amount_expr},
+                adj_factor,
+                qfq_open,
+                qfq_high,
+                qfq_low,
+                qfq_close,
                 provider,
                 updated_at
             FROM daily_bars
@@ -476,20 +558,46 @@ class MarketRepository:
         universe = provider.get_universe()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         bars_written = 0
+        current_symbols = [str(item.symbol).zfill(6) for item in universe]
         stock_basics = provider.get_stock_basics([item.symbol for item in universe])
+        financial_indicators = provider.get_financial_indicators([item.symbol for item in universe])
         stock_basic_map = (
             stock_basics.set_index("symbol").to_dict(orient="index")
             if not stock_basics.empty and "symbol" in stock_basics.columns
             else {}
         )
+        financial_indicator_map = (
+            financial_indicators.set_index("symbol").to_dict(orient="index")
+            if not financial_indicators.empty and "symbol" in financial_indicators.columns
+            else {}
+        )
 
         with self.connect() as conn:
+            if current_symbols:
+                placeholders = ",".join("?" for _ in current_symbols)
+                conn.execute(
+                    f"DELETE FROM universe WHERE provider = ? AND symbol NOT IN ({placeholders})",
+                    (provider_name, *current_symbols),
+                )
+                conn.execute(
+                    f"DELETE FROM daily_bars WHERE provider = ? AND symbol NOT IN ({placeholders})",
+                    (provider_name, *current_symbols),
+                )
+            else:
+                conn.execute("DELETE FROM universe WHERE provider = ?", (provider_name,))
+                conn.execute("DELETE FROM daily_bars WHERE provider = ?", (provider_name,))
+
             for item in universe:
                 profile = stock_basic_map.get(item.symbol, {})
+                financial_profile = financial_indicator_map.get(item.symbol, {})
                 conn.execute(
                     """
-                    INSERT INTO universe(symbol, name, area, industry, market, exchange, list_date, provider, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO universe(
+                        symbol, name, area, industry, market, exchange, list_date,
+                        fin_ann_date, fin_end_date, roe_dt, grossprofit_margin, debt_to_assets, ocfps,
+                        provider, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(symbol, provider) DO UPDATE SET
                         name=excluded.name,
                         area=excluded.area,
@@ -497,6 +605,12 @@ class MarketRepository:
                         market=excluded.market,
                         exchange=excluded.exchange,
                         list_date=excluded.list_date,
+                        fin_ann_date=excluded.fin_ann_date,
+                        fin_end_date=excluded.fin_end_date,
+                        roe_dt=excluded.roe_dt,
+                        grossprofit_margin=excluded.grossprofit_margin,
+                        debt_to_assets=excluded.debt_to_assets,
+                        ocfps=excluded.ocfps,
                         updated_at=excluded.updated_at
                     """,
                     (
@@ -507,6 +621,16 @@ class MarketRepository:
                         str(profile.get("market", "") or ""),
                         str(profile.get("exchange", "") or ""),
                         str(profile.get("list_date", "") or ""),
+                        str(financial_profile.get("fin_ann_date", "") or ""),
+                        str(financial_profile.get("fin_end_date", "") or ""),
+                        float(financial_profile["roe_dt"]) if pd.notna(financial_profile.get("roe_dt")) else None,
+                        float(financial_profile["grossprofit_margin"])
+                        if pd.notna(financial_profile.get("grossprofit_margin"))
+                        else None,
+                        float(financial_profile["debt_to_assets"])
+                        if pd.notna(financial_profile.get("debt_to_assets"))
+                        else None,
+                        float(financial_profile["ocfps"]) if pd.notna(financial_profile.get("ocfps")) else None,
                         provider_name,
                         now,
                     ),
@@ -518,20 +642,62 @@ class MarketRepository:
                     datetime.combine(pd.to_datetime(bars["trade_date"].min()).date(), datetime.min.time()),
                     datetime.combine(pd.to_datetime(bars["trade_date"].max()).date(), datetime.min.time()),
                 )
+                adj_factors = provider.get_adj_factors(
+                    item.symbol,
+                    datetime.combine(pd.to_datetime(bars["trade_date"].min()).date(), datetime.min.time()),
+                    datetime.combine(pd.to_datetime(bars["trade_date"].max()).date(), datetime.min.time()),
+                )
+                moneyflow = provider.get_moneyflow(
+                    item.symbol,
+                    datetime.combine(pd.to_datetime(bars["trade_date"].min()).date(), datetime.min.time()),
+                    datetime.combine(pd.to_datetime(bars["trade_date"].max()).date(), datetime.min.time()),
+                )
                 if not basics.empty:
                     bars = bars.merge(basics, on="trade_date", how="left")
+                if not adj_factors.empty:
+                    bars = bars.merge(adj_factors, on="trade_date", how="left")
+                if not moneyflow.empty:
+                    bars = bars.merge(moneyflow, on="trade_date", how="left")
                 for column in ["turnover_rate_f", "pe_ttm", "pb", "total_mv", "circ_mv"]:
                     if column not in bars.columns:
                         bars[column] = None
+                for column in ["buy_lg_amount", "sell_lg_amount", "buy_elg_amount", "sell_elg_amount", "net_mf_amount"]:
+                    if column not in bars.columns:
+                        bars[column] = None
+                if "adj_factor" not in bars.columns:
+                    bars["adj_factor"] = None
+                bars["adj_factor"] = pd.to_numeric(bars["adj_factor"], errors="coerce")
+                valid_adj = bars["adj_factor"].dropna()
+                if not valid_adj.empty:
+                    latest_adj = float(valid_adj.iloc[-1])
+                    if latest_adj > 0:
+                        scale = bars["adj_factor"] / latest_adj
+                        bars["qfq_open"] = bars["open"] * scale
+                        bars["qfq_high"] = bars["high"] * scale
+                        bars["qfq_low"] = bars["low"] * scale
+                        bars["qfq_close"] = bars["close"] * scale
+                    else:
+                        bars["qfq_open"] = bars["open"]
+                        bars["qfq_high"] = bars["high"]
+                        bars["qfq_low"] = bars["low"]
+                        bars["qfq_close"] = bars["close"]
+                else:
+                    bars["qfq_open"] = bars["open"]
+                    bars["qfq_high"] = bars["high"]
+                    bars["qfq_low"] = bars["low"]
+                    bars["qfq_close"] = bars["close"]
                 bars["trade_date"] = bars["trade_date"].astype(str)
                 for _, row in bars.iterrows():
                     conn.execute(
                         """
                         INSERT INTO daily_bars(
                             symbol, trade_date, open, high, low, close, volume, amount, turnover_rate,
-                            turnover_rate_f, pe_ttm, pb, total_mv, circ_mv, provider, updated_at
+                            turnover_rate_f, pe_ttm, pb, total_mv, circ_mv,
+                            buy_lg_amount, sell_lg_amount, buy_elg_amount, sell_elg_amount, net_mf_amount,
+                            adj_factor,
+                            qfq_open, qfq_high, qfq_low, qfq_close, provider, updated_at
                         )
-                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(symbol, trade_date, provider) DO UPDATE SET
                             open=excluded.open,
                             high=excluded.high,
@@ -545,6 +711,16 @@ class MarketRepository:
                             pb=excluded.pb,
                             total_mv=excluded.total_mv,
                             circ_mv=excluded.circ_mv,
+                            buy_lg_amount=excluded.buy_lg_amount,
+                            sell_lg_amount=excluded.sell_lg_amount,
+                            buy_elg_amount=excluded.buy_elg_amount,
+                            sell_elg_amount=excluded.sell_elg_amount,
+                            net_mf_amount=excluded.net_mf_amount,
+                            adj_factor=excluded.adj_factor,
+                            qfq_open=excluded.qfq_open,
+                            qfq_high=excluded.qfq_high,
+                            qfq_low=excluded.qfq_low,
+                            qfq_close=excluded.qfq_close,
                             updated_at=excluded.updated_at
                         """,
                         (
@@ -562,6 +738,16 @@ class MarketRepository:
                             float(row["pb"]) if pd.notna(row.get("pb")) else None,
                             float(row["total_mv"]) if pd.notna(row.get("total_mv")) else None,
                             float(row["circ_mv"]) if pd.notna(row.get("circ_mv")) else None,
+                            float(row["buy_lg_amount"]) if pd.notna(row.get("buy_lg_amount")) else None,
+                            float(row["sell_lg_amount"]) if pd.notna(row.get("sell_lg_amount")) else None,
+                            float(row["buy_elg_amount"]) if pd.notna(row.get("buy_elg_amount")) else None,
+                            float(row["sell_elg_amount"]) if pd.notna(row.get("sell_elg_amount")) else None,
+                            float(row["net_mf_amount"]) if pd.notna(row.get("net_mf_amount")) else None,
+                            float(row["adj_factor"]) if pd.notna(row.get("adj_factor")) else None,
+                            float(row["qfq_open"]) if pd.notna(row.get("qfq_open")) else None,
+                            float(row["qfq_high"]) if pd.notna(row.get("qfq_high")) else None,
+                            float(row["qfq_low"]) if pd.notna(row.get("qfq_low")) else None,
+                            float(row["qfq_close"]) if pd.notna(row.get("qfq_close")) else None,
                             provider_name,
                             now,
                         ),
@@ -595,7 +781,9 @@ class MarketRepository:
         active_provider = provider or self.default_provider
         query = """
         SELECT trade_date, open, high, low, close, volume, amount, turnover_rate,
-               turnover_rate_f, pe_ttm, pb, total_mv, circ_mv
+               turnover_rate_f, pe_ttm, pb, total_mv, circ_mv,
+               buy_lg_amount, sell_lg_amount, buy_elg_amount, sell_elg_amount, net_mf_amount,
+               adj_factor, qfq_open, qfq_high, qfq_low, qfq_close
         FROM daily_bars
         WHERE symbol = ? AND provider = ?
         ORDER BY trade_date DESC
@@ -616,7 +804,9 @@ class MarketRepository:
         with self.connect() as conn:
             return pd.read_sql_query(
                 """
-                SELECT symbol, name, area, industry, market, exchange, list_date
+                SELECT
+                    symbol, name, area, industry, market, exchange, list_date,
+                    fin_ann_date, fin_end_date, roe_dt, grossprofit_margin, debt_to_assets, ocfps
                 FROM universe
                 WHERE provider = ?
                 ORDER BY symbol
@@ -1074,6 +1264,88 @@ class MarketRepository:
             }
         return reviews
 
+    @staticmethod
+    def _normalize_trade_date(value: object) -> date | None:
+        if value in {None, ""}:
+            return None
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
+            return None
+        return parsed.date()
+
+    @staticmethod
+    def _resolve_price_series(history: pd.DataFrame) -> pd.Series:
+        if history.empty:
+            return pd.Series(dtype=float)
+        if "qfq_close" in history.columns:
+            adjusted = pd.to_numeric(history["qfq_close"], errors="coerce")
+            if adjusted.notna().any():
+                return adjusted.fillna(pd.to_numeric(history["close"], errors="coerce"))
+        return pd.to_numeric(history["close"], errors="coerce")
+
+    def _compute_forward_return_windows(
+        self,
+        history: pd.DataFrame,
+        trade_date: object,
+        *,
+        horizons: tuple[int, ...] = (1, 3, 5, 10),
+        entry_price: float | None = None,
+        action: str = "",
+    ) -> dict:
+        target_date = self._normalize_trade_date(trade_date)
+        if history.empty or target_date is None:
+            return {}
+
+        frame = history.copy()
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.date
+        frame = frame.dropna(subset=["trade_date"]).sort_values("trade_date").reset_index(drop=True)
+        if frame.empty:
+            return {}
+
+        matched = frame.index[frame["trade_date"] == target_date].tolist()
+        if not matched:
+            return {}
+
+        start_idx = int(matched[-1])
+        price_series = self._resolve_price_series(frame)
+        base_price = float(entry_price) if entry_price and entry_price > 0 else float(price_series.iloc[start_idx] or 0.0)
+        if base_price <= 0:
+            return {}
+
+        signed_multiplier = -1.0 if str(action).strip() in {"卖出", "减仓"} else 1.0
+        results: dict[str, object] = {
+            "base_trade_date": target_date.isoformat(),
+            "base_price": base_price,
+        }
+        available_horizons: list[int] = []
+
+        for horizon in horizons:
+            end_idx = start_idx + int(horizon)
+            key = f"return_{int(horizon)}d"
+            if end_idx >= len(frame):
+                results[key] = None
+                continue
+            future_price = float(price_series.iloc[end_idx] or 0.0)
+            if future_price <= 0:
+                results[key] = None
+                continue
+            available_horizons.append(int(horizon))
+            results[key] = float((future_price / base_price - 1.0) * signed_multiplier)
+
+        results["available_horizons"] = available_horizons
+        results["primary_horizon_days"] = 5
+        results["primary_return"] = results.get("return_5d")
+        return results
+
+    def _load_history_map(self, symbols: list[str], provider: str | None = None, limit: int = 260) -> dict[str, pd.DataFrame]:
+        active_provider = provider or self.default_provider
+        history_map: dict[str, pd.DataFrame] = {}
+        for symbol in sorted({str(item).zfill(6) for item in symbols if item}):
+            history = self.load_symbol_history(symbol, limit=limit, provider=active_provider)
+            if not history.empty:
+                history_map[symbol] = history
+        return history_map
+
     def load_recent_signal_batches(
         self,
         limit: int = 12,
@@ -1142,6 +1414,7 @@ class MarketRepository:
             }
         )
         latest_price_map = self.load_latest_prices(replay_symbols, provider=active_provider) if replay_symbols else {}
+        history_map = self._load_history_map(replay_symbols, provider=active_provider, limit=260) if replay_symbols else {}
         rows: list[dict] = []
         for _, run in runs.iterrows():
             model_run_id = int(run["id"])
@@ -1161,6 +1434,40 @@ class MarketRepository:
                 for item in execution_items
                 if int(item.get("executed_quantity", 0) or 0) > 0 and float(item.get("executed_price", 0.0) or 0.0) > 0
             ]
+            signal_trade_date = str(batch_predictions[0]["trade_date"]) if batch_predictions else ""
+
+            signal_outcome_rows = []
+            for item in batch_predictions:
+                symbol = str(item.get("symbol", "")).zfill(6)
+                history = history_map.get(symbol)
+                if history is None:
+                    continue
+                window = self._compute_forward_return_windows(history, signal_trade_date)
+                if not window:
+                    continue
+                signal_outcome_rows.append(window)
+
+            signal_outcome: dict[str, object] = {
+                "tracked_symbols": len(signal_outcome_rows),
+                "primary_horizon_days": 5,
+            }
+            for horizon in (1, 3, 5, 10):
+                values = [
+                    float(item[f"return_{horizon}d"])
+                    for item in signal_outcome_rows
+                    if item.get(f"return_{horizon}d") is not None
+                ]
+                signal_outcome[f"tracked_symbols_{horizon}d"] = len(values)
+                signal_outcome[f"avg_forward_return_{horizon}d"] = (
+                    round(float(sum(values) / len(values)), 6) if values else None
+                )
+                signal_outcome[f"best_forward_return_{horizon}d"] = (
+                    round(float(max(values)), 6) if values else None
+                )
+                signal_outcome[f"worst_forward_return_{horizon}d"] = (
+                    round(float(min(values)), 6) if values else None
+                )
+
             priced_items = []
             detailed_execution_items = []
             for item in executed_items:
@@ -1173,6 +1480,13 @@ class MarketRepository:
                 latest_value = latest_price * executed_quantity if latest_price > 0 else 0.0
                 signed_return = 0.0
                 signed_pnl = 0.0
+                fixed_window = self._compute_forward_return_windows(
+                    history_map.get(symbol, pd.DataFrame()),
+                    signal_trade_date,
+                    entry_price=executed_price,
+                    action=action,
+                )
+                primary_window_return = fixed_window.get("primary_return") if fixed_window else None
                 if latest_price <= 0 or executed_price <= 0 or executed_quantity <= 0:
                     detailed_execution_items.append(
                         {
@@ -1185,6 +1499,7 @@ class MarketRepository:
                             "latest_price": latest_price,
                             "signed_return": 0.0,
                             "signed_pnl": 0.0,
+                            "window_returns": fixed_window or {},
                             "tracked": False,
                             "note": str(item.get("note", "") or ""),
                         }
@@ -1200,7 +1515,17 @@ class MarketRepository:
                     if action in {"买入", "加仓"}
                     else (executed_price - latest_price) * executed_quantity
                 )
-                priced_items.append({"symbol": symbol, "action": action, "notional": notional, "signed_return": signed_return})
+                display_return = float(primary_window_return) if primary_window_return is not None else float(signed_return)
+                display_pnl = float(notional * display_return)
+                if primary_window_return is not None:
+                    priced_items.append(
+                        {
+                            "symbol": symbol,
+                            "action": action,
+                            "notional": notional,
+                            "signed_return": float(primary_window_return),
+                        }
+                    )
                 detailed_execution_items.append(
                     {
                         "symbol": symbol,
@@ -1211,9 +1536,10 @@ class MarketRepository:
                         "executed_price": executed_price,
                         "latest_price": latest_price,
                         "latest_value": latest_value,
-                        "signed_return": round(float(signed_return), 6),
-                        "signed_pnl": round(float(signed_pnl), 2),
-                        "tracked": True,
+                        "signed_return": round(display_return, 6),
+                        "signed_pnl": round(display_pnl, 2),
+                        "window_returns": fixed_window or {},
+                        "tracked": primary_window_return is not None,
                         "note": str(item.get("note", "") or ""),
                     }
                 )
@@ -1235,7 +1561,7 @@ class MarketRepository:
                     "model_name": str(run["model_name"]),
                     "provider": str(run["provider"]),
                     "generated_at": str(run["run_at"]),
-                    "signal_trade_date": str(batch_predictions[0]["trade_date"]) if batch_predictions else "",
+                    "signal_trade_date": signal_trade_date,
                     "top_symbols": [str(item["symbol"]) for item in batch_predictions],
                     "top_names": [str(item["name"]) for item in batch_predictions],
                     "top_prices": [float(latest_price_map.get(str(item["symbol"]).zfill(6), 0.0) or 0.0) for item in batch_predictions],
@@ -1250,7 +1576,9 @@ class MarketRepository:
                         "priced_items_count": len(priced_items),
                         "weighted_post_trade_move": round(float(weighted_post_trade_move), 6),
                         "tracked_notional": round(sum(item["notional"] for item in priced_items), 2),
+                        "primary_horizon_days": 5,
                     },
+                    "signal_outcome": signal_outcome,
                     "execution_items": detailed_execution_items,
                 }
             )

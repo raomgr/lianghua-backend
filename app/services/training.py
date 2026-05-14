@@ -73,6 +73,23 @@ def _safe_float(value: float | np.floating | int) -> float:
     return value
 
 
+def resolve_model_spec(model_name: str | None = None) -> dict[str, Any] | None:
+    if model_name:
+        for spec in MODEL_SPECS:
+            if str(spec.get("name")) == str(model_name):
+                return dict(spec)
+        return None
+    return dict(MODEL_SPECS[0]) if MODEL_SPECS else None
+
+
+def fit_model_for_spec(train_df: pd.DataFrame, spec: dict[str, Any]) -> Any:
+    return _fit_model(train_df, spec)
+
+
+def predict_with_model(frame: pd.DataFrame, model: Any) -> np.ndarray:
+    return _predict(frame, model)
+
+
 def _split_dataset(dataset: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     unique_dates = sorted(dataset["trade_date"].unique())
     if len(unique_dates) < 8:

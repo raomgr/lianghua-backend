@@ -8,7 +8,14 @@ import numpy as np
 import pandas as pd
 
 from app.services.data_provider import BaseProvider
-from app.services.factor_engine import build_factor_table, build_factor_table_from_histories, enrich_bars
+from app.services.factor_engine import (
+    FEATURE_COLUMNS,
+    build_factor_table,
+    build_factor_table_from_histories,
+    build_training_dataset_from_histories,
+    enrich_bars,
+)
+from app.services.training import fit_model_for_spec, predict_with_model, resolve_model_spec
 
 REBALANCE_DAYS = 5
 TRADING_COST_BPS = 8
@@ -22,6 +29,8 @@ class BacktestConfig:
     top_n: int = TOP_N
     trading_cost_bps: float = TRADING_COST_BPS
     slippage_bps: float = SLIPPAGE_BPS
+    backtest_mode: str = "rule"
+    model_name: str | None = None
 
 
 def _max_drawdown(series: pd.Series) -> float:
@@ -82,6 +91,10 @@ def _compute_beta_alpha(portfolio_returns: pd.Series, benchmark_returns: pd.Seri
 def _build_empty_backtest_payload(config: BacktestConfig) -> dict:
     return {
         "summary": {
+            "backtest_mode": str(config.backtest_mode or "rule"),
+            "signal_source": "model-walk-forward" if config.backtest_mode == "model" else "factor-rule",
+            "model_name": config.model_name if config.backtest_mode == "model" else None,
+            "benchmark_name": "universe-equal-weight",
             "annual_return": 0.0,
             "annual_volatility": 0.0,
             "max_drawdown": 0.0,
@@ -106,6 +119,391 @@ def _build_empty_backtest_payload(config: BacktestConfig) -> dict:
     }
 
 
+def _build_feature_frame_from_histories(
+    histories: dict[str, pd.DataFrame],
+    names: dict[str, str] | None = None,
+    *,
+    min_history: int = 80,
+    max_bars: int = 180,
+    max_common_dates: int = 120,
+) -> tuple[pd.DataFrame, dict[str, pd.Series], list]:
+    usable_histories = {symbol: enrich_bars(frame.tail(max_bars)) for symbol, frame in histories.items() if len(frame) >= min_history}
+    if not usable_histories:
+        return pd.DataFrame(), {}, []
+
+    common_dates = sorted(set.intersection(*[set(frame["trade_date"]) for frame in usable_histories.values()]))
+    common_dates = common_dates[-max_common_dates:]
+    if len(common_dates) < 2:
+        return pd.DataFrame(), {}, []
+
+    returns_by_symbol: dict[str, pd.Series] = {}
+    feature_rows = []
+    feature_columns = [
+        "trade_date",
+        "symbol",
+        "name",
+        "close",
+        *FEATURE_COLUMNS,
+    ]
+
+    for symbol, frame in usable_histories.items():
+        aligned = frame[frame["trade_date"].isin(common_dates)].copy().reset_index(drop=True)
+        if len(aligned) != len(common_dates):
+            continue
+        returns_by_symbol[symbol] = pd.Series(aligned["ret_1d"].fillna(0).values, index=common_dates)
+        for _, row in aligned.iterrows():
+            feature_rows.append(
+                {
+                    "trade_date": row["trade_date"],
+                    "symbol": symbol,
+                    "name": (names or {}).get(symbol, symbol),
+                    "close": float(row["close"]),
+                    **{feature: float(row[feature]) for feature in FEATURE_COLUMNS},
+                }
+            )
+
+    feature_frame = pd.DataFrame(feature_rows, columns=feature_columns)
+    if feature_frame.empty:
+        return pd.DataFrame(), {}, []
+    return feature_frame, returns_by_symbol, common_dates
+
+
+def _rank_rule_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
+    ranked = snapshot.copy()
+    score_inputs = [
+        "return_5d",
+        "momentum_20",
+        "momentum_60",
+        "volatility_20",
+        "volume_ratio_5",
+        "turnover_ratio_5",
+        "close_position_20",
+    ]
+    ranked[score_inputs] = ranked[score_inputs].fillna(0.0)
+    ranked["momentum_rank"] = ranked["momentum_20"].rank(pct=True)
+    ranked["trend_rank"] = ranked["momentum_60"].rank(pct=True)
+    ranked["quality_rank"] = ranked["return_5d"].rank(pct=True)
+    ranked["liquidity_rank"] = ranked["volume_ratio_5"].rank(pct=True)
+    ranked["participation_rank"] = ranked["turnover_ratio_5"].rank(pct=True)
+    ranked["structure_rank"] = ranked["close_position_20"].rank(pct=True)
+    ranked["risk_rank"] = 1 - ranked["volatility_20"].rank(pct=True)
+    ranked["score"] = (
+        ranked["momentum_rank"] * 0.22
+        + ranked["trend_rank"] * 0.18
+        + ranked["quality_rank"] * 0.16
+        + ranked["liquidity_rank"] * 0.12
+        + ranked["participation_rank"] * 0.10
+        + ranked["structure_rank"] * 0.10
+        + ranked["risk_rank"] * 0.12
+    )
+    return ranked.sort_values("score", ascending=False).reset_index(drop=True)
+
+
+def _format_backtest_result(
+    *,
+    portfolio_ret: pd.Series,
+    benchmark_returns: pd.Series,
+    common_dates: list,
+    config: BacktestConfig,
+    latest_snapshot: pd.DataFrame,
+    rebalance_log: list[dict],
+    turnover_values: list[float],
+    total_cost: float,
+) -> dict:
+    equity = (1 + portfolio_ret).cumprod()
+    benchmark = (1 + benchmark_returns).cumprod()
+
+    sharpe = 0.0
+    if portfolio_ret.std() > 0:
+        sharpe = float((portfolio_ret.mean() / portfolio_ret.std()) * math.sqrt(252))
+
+    annual_return = float((equity.iloc[-1] ** (252 / max(len(equity), 1))) - 1)
+    annual_volatility = _annualized_volatility(portfolio_ret)
+    max_drawdown = _max_drawdown(equity)
+    benchmark_return = float(benchmark.iloc[-1] - 1)
+    total_return = float(equity.iloc[-1] - 1)
+    sortino = _safe_sortino(annual_return, portfolio_ret)
+    information_ratio = _information_ratio(portfolio_ret, benchmark_returns)
+    beta, alpha = _compute_beta_alpha(portfolio_ret, benchmark_returns)
+    summary = {
+        "backtest_mode": str(config.backtest_mode or "rule"),
+        "signal_source": "model-walk-forward" if config.backtest_mode == "model" else "factor-rule",
+        "model_name": config.model_name if config.backtest_mode == "model" else None,
+        "benchmark_name": "universe-equal-weight",
+        "annual_return": annual_return,
+        "annual_volatility": annual_volatility,
+        "max_drawdown": max_drawdown,
+        "calmar": _safe_calmar(annual_return, max_drawdown),
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "information_ratio": information_ratio,
+        "beta": beta,
+        "alpha": alpha,
+        "win_rate": float((portfolio_ret > 0).mean()),
+        "total_return": total_return,
+        "benchmark_return": benchmark_return,
+        "excess_return": float(total_return - benchmark_return),
+        "avg_turnover": float(sum(turnover_values) / len(turnover_values)) if turnover_values else 0.0,
+        "total_cost": float(total_cost),
+        "rebalance_days": config.rebalance_days,
+        "holdings_per_rebalance": config.top_n,
+    }
+
+    equity_curve = [
+        {
+            "trade_date": common_dates[i],
+            "equity": round(float(equity.iloc[i]), 4),
+            "benchmark": round(float(benchmark.iloc[i]), 4),
+        }
+        for i in range(len(equity))
+    ]
+
+    picks = latest_snapshot.head(config.top_n)[
+        [
+            "symbol",
+            "close",
+            "ret_1d",
+            "return_5d",
+            "return_10d",
+            "momentum_20",
+            "momentum_60",
+            "reversal_10",
+            "volatility_10",
+            "volatility_20",
+            "volatility_60",
+            "volume_ratio_5",
+            "volume_ratio_20",
+            "turnover_rate",
+            "turnover_ratio_5",
+            "price_vs_ma_20",
+            "price_vs_ma_60",
+            "breakout_20",
+            "close_position_20",
+            "intraday_range",
+            "atr_14",
+            "score",
+        ]
+    ].to_dict(orient="records")
+
+    return {
+        "summary": summary,
+        "equity_curve": equity_curve,
+        "picks": picks,
+        "rebalances": rebalance_log[-8:],
+    }
+
+
+def _run_rule_based_backtest_from_histories(
+    histories: dict[str, pd.DataFrame],
+    names: dict[str, str] | None = None,
+    config: BacktestConfig | None = None,
+) -> dict:
+    config = config or BacktestConfig()
+    feature_frame, returns_by_symbol, common_dates = _build_feature_frame_from_histories(histories, names=names)
+    if feature_frame.empty or not returns_by_symbol or not common_dates:
+        return _build_empty_backtest_payload(config)
+
+    date_index = {trade_date: idx for idx, trade_date in enumerate(common_dates)}
+    signal_dates = common_dates[:-1: config.rebalance_days] if len(common_dates) > 1 else []
+    positions_by_date: dict = {}
+    previous_holdings: set[str] = set()
+    cost_rate = (config.trading_cost_bps + config.slippage_bps) / 10000
+    turnover_values: list[float] = []
+    total_cost = 0.0
+    rebalance_log: list[dict] = []
+    rebalance_cost_by_date: dict = {}
+
+    for signal_date in signal_dates:
+        snapshot = feature_frame[feature_frame["trade_date"] == signal_date].copy()
+        if snapshot.empty:
+            continue
+        ranked = _rank_rule_snapshot(snapshot)
+        top_snapshot = ranked.head(config.top_n).copy()
+        holdings = set(top_snapshot["symbol"].tolist())
+        changed = previous_holdings.symmetric_difference(holdings)
+        turnover = len(changed) / max(config.top_n * 2, 1)
+        turnover_values.append(turnover)
+        total_cost += turnover * cost_rate
+        signal_idx = date_index[signal_date]
+        execution_idx = min(signal_idx + 1, len(common_dates) - 1)
+        execution_date = common_dates[execution_idx]
+        rebalance_cost_by_date[execution_date] = float(turnover * cost_rate)
+        rebalance_log.append(
+            {
+                "trade_date": execution_date,
+                "turnover": float(turnover),
+                "estimated_cost": float(turnover * cost_rate),
+                "holdings": [
+                    {
+                        "symbol": row["symbol"],
+                        "name": row["name"],
+                        "score": float(row["score"]),
+                    }
+                    for _, row in top_snapshot.iterrows()
+                ],
+            }
+        )
+        previous_holdings = holdings
+
+        start_idx = execution_idx
+        end_idx = min(start_idx + config.rebalance_days, len(common_dates))
+        for idx in range(start_idx, end_idx):
+            positions_by_date[common_dates[idx]] = list(holdings)
+
+    portfolio_returns = []
+    benchmark_frame = pd.DataFrame(returns_by_symbol).reindex(common_dates).fillna(0.0)
+    benchmark_returns = (
+        benchmark_frame.mean(axis=1)
+        if not benchmark_frame.empty
+        else pd.Series([0.0] * len(common_dates), index=common_dates)
+    )
+
+    for trade_date in common_dates:
+        holdings = positions_by_date.get(trade_date, [])
+        day_returns = [returns_by_symbol[symbol].loc[trade_date] for symbol in holdings if symbol in returns_by_symbol]
+        gross_return = float(sum(day_returns) / len(day_returns)) if day_returns else 0.0
+        day_cost = float(rebalance_cost_by_date.get(trade_date, 0.0))
+        portfolio_returns.append(gross_return - day_cost)
+
+    portfolio_ret = pd.Series(portfolio_returns, index=common_dates)
+    latest_snapshot = _rank_rule_snapshot(feature_frame[feature_frame["trade_date"] == common_dates[-1]].copy())
+    return _format_backtest_result(
+        portfolio_ret=portfolio_ret,
+        benchmark_returns=benchmark_returns,
+        common_dates=common_dates,
+        config=config,
+        latest_snapshot=latest_snapshot,
+        rebalance_log=rebalance_log,
+        turnover_values=turnover_values,
+        total_cost=total_cost,
+    )
+
+
+def _run_model_backtest_from_histories(
+    histories: dict[str, pd.DataFrame],
+    names: dict[str, str] | None = None,
+    config: BacktestConfig | None = None,
+) -> dict:
+    config = config or BacktestConfig(backtest_mode="model")
+    dataset = build_training_dataset_from_histories(histories, names=names)
+    if dataset.empty or len(dataset) < 60:
+        return _build_empty_backtest_payload(config)
+
+    spec = resolve_model_spec(config.model_name)
+    if not spec:
+        return _build_empty_backtest_payload(config)
+    config.model_name = str(spec["name"])
+
+    feature_frame, returns_by_symbol, common_dates = _build_feature_frame_from_histories(histories, names=names)
+    if feature_frame.empty or not returns_by_symbol or not common_dates:
+        return _build_empty_backtest_payload(config)
+
+    available_dates = sorted(set(dataset["trade_date"]).intersection(common_dates))
+    if len(available_dates) < 12:
+        return _build_empty_backtest_payload(config)
+
+    date_index = {trade_date: idx for idx, trade_date in enumerate(common_dates)}
+    min_train_dates = max(min(40, len(available_dates) - 2), max(8, len(available_dates) // 3))
+    signal_dates = available_dates[min_train_dates:-1: config.rebalance_days]
+    if not signal_dates:
+        return _build_empty_backtest_payload(config)
+
+    positions_by_date: dict = {}
+    previous_holdings: set[str] = set()
+    cost_rate = (config.trading_cost_bps + config.slippage_bps) / 10000
+    turnover_values: list[float] = []
+    total_cost = 0.0
+    rebalance_log: list[dict] = []
+    rebalance_cost_by_date: dict = {}
+    latest_snapshot = pd.DataFrame()
+
+    for signal_date in signal_dates:
+        train_df = dataset[dataset["trade_date"] < signal_date].copy()
+        snapshot = feature_frame[feature_frame["trade_date"] == signal_date].copy()
+        if train_df.empty or snapshot.empty:
+            continue
+        if len(train_df["trade_date"].unique()) < min_train_dates:
+            continue
+
+        model = fit_model_for_spec(train_df, spec)
+        snapshot["predicted_return_5d"] = predict_with_model(snapshot, model)
+        snapshot["score"] = snapshot["predicted_return_5d"].rank(pct=True)
+        ranked = snapshot.sort_values("predicted_return_5d", ascending=False).reset_index(drop=True)
+        latest_snapshot = ranked.copy()
+        top_snapshot = ranked.head(config.top_n).copy()
+        holdings = set(top_snapshot["symbol"].tolist())
+        changed = previous_holdings.symmetric_difference(holdings)
+        turnover = len(changed) / max(config.top_n * 2, 1)
+        turnover_values.append(turnover)
+        total_cost += turnover * cost_rate
+        signal_idx = date_index[signal_date]
+        execution_idx = min(signal_idx + 1, len(common_dates) - 1)
+        execution_date = common_dates[execution_idx]
+        rebalance_cost_by_date[execution_date] = float(turnover * cost_rate)
+        rebalance_log.append(
+            {
+                "trade_date": execution_date,
+                "turnover": float(turnover),
+                "estimated_cost": float(turnover * cost_rate),
+                "holdings": [
+                    {
+                        "symbol": row["symbol"],
+                        "name": row["name"],
+                        "score": float(row["score"]),
+                    }
+                    for _, row in top_snapshot.iterrows()
+                ],
+            }
+        )
+        previous_holdings = holdings
+
+        start_idx = execution_idx
+        end_idx = min(start_idx + config.rebalance_days, len(common_dates))
+        for idx in range(start_idx, end_idx):
+            positions_by_date[common_dates[idx]] = list(holdings)
+
+    if latest_snapshot.empty:
+        return _build_empty_backtest_payload(config)
+
+    portfolio_returns = []
+    benchmark_frame = pd.DataFrame(returns_by_symbol).reindex(common_dates).fillna(0.0)
+    benchmark_returns = (
+        benchmark_frame.mean(axis=1)
+        if not benchmark_frame.empty
+        else pd.Series([0.0] * len(common_dates), index=common_dates)
+    )
+
+    for trade_date in common_dates:
+        holdings = positions_by_date.get(trade_date, [])
+        day_returns = [returns_by_symbol[symbol].loc[trade_date] for symbol in holdings if symbol in returns_by_symbol]
+        gross_return = float(sum(day_returns) / len(day_returns)) if day_returns else 0.0
+        day_cost = float(rebalance_cost_by_date.get(trade_date, 0.0))
+        portfolio_returns.append(gross_return - day_cost)
+
+    portfolio_ret = pd.Series(portfolio_returns, index=common_dates)
+    return _format_backtest_result(
+        portfolio_ret=portfolio_ret,
+        benchmark_returns=benchmark_returns,
+        common_dates=common_dates,
+        config=config,
+        latest_snapshot=latest_snapshot,
+        rebalance_log=rebalance_log,
+        turnover_values=turnover_values,
+        total_cost=total_cost,
+    )
+
+
+def run_backtest_from_histories(
+    histories: dict[str, pd.DataFrame],
+    names: dict[str, str] | None = None,
+    config: BacktestConfig | None = None,
+) -> dict:
+    config = config or BacktestConfig()
+    if str(config.backtest_mode or "rule").lower() == "model":
+        return _run_model_backtest_from_histories(histories, names=names, config=config)
+    return _run_rule_based_backtest_from_histories(histories, names=names, config=config)
+
+
 def run_baseline_backtest(provider: BaseProvider, top_n: int = 3) -> dict:
     factor_table = build_factor_table(provider)
     picks = factor_table.head(top_n).copy()
@@ -121,9 +519,16 @@ def run_baseline_backtest(provider: BaseProvider, top_n: int = 3) -> dict:
         if dates is None:
             dates = bars["trade_date"].reset_index(drop=True)
 
-    benchmark_symbol = factor_table.iloc[-1]["symbol"]
-    benchmark_bars = enrich_bars(provider.get_daily_bars(benchmark_symbol, limit=60))
-    benchmark_returns = benchmark_bars["ret_1d"].fillna(0).reset_index(drop=True)
+    universe_returns = []
+    for item in provider.get_universe():
+        bars = enrich_bars(provider.get_daily_bars(item.symbol, limit=60))
+        universe_returns.append(bars["ret_1d"].fillna(0).reset_index(drop=True))
+
+    benchmark_returns = (
+        pd.concat(universe_returns, axis=1).mean(axis=1)
+        if universe_returns
+        else pd.Series([0.0] * len(daily_returns[0]) if daily_returns else [0.0])
+    )
 
     portfolio_ret = pd.concat(daily_returns, axis=1).mean(axis=1)
     equity = (1 + portfolio_ret).cumprod()
@@ -182,219 +587,7 @@ def run_baseline_backtest_from_histories(
     names: dict[str, str] | None = None,
     config: BacktestConfig | None = None,
 ) -> dict:
-    config = config or BacktestConfig()
-    factor_table = build_factor_table_from_histories(histories, names=names)
-    if factor_table.empty:
-        return _build_empty_backtest_payload(config)
-
-    usable_histories = {symbol: enrich_bars(frame.tail(120)) for symbol, frame in histories.items() if len(frame) >= 80}
-    if not usable_histories:
-        return _build_empty_backtest_payload(config)
-
-    common_dates = sorted(set.intersection(*[set(frame["trade_date"]) for frame in usable_histories.values()]))
-    common_dates = common_dates[-60:]
-    date_index = {trade_date: idx for idx, trade_date in enumerate(common_dates)}
-
-    returns_by_symbol: dict[str, pd.Series] = {}
-    feature_rows = []
-    for symbol, frame in usable_histories.items():
-        aligned = frame[frame["trade_date"].isin(common_dates)].copy().reset_index(drop=True)
-        if len(aligned) != len(common_dates):
-            continue
-        returns_by_symbol[symbol] = pd.Series(aligned["ret_1d"].fillna(0).values, index=common_dates)
-        for _, row in aligned.iterrows():
-            feature_rows.append(
-                {
-                    "trade_date": row["trade_date"],
-                    "symbol": symbol,
-                    "name": (names or {}).get(symbol, symbol),
-                    "close": float(row["close"]),
-                    "ret_1d": float(row["ret_1d"]),
-                    "return_5d": float(row["return_5d"]),
-                    "return_10d": float(row["return_10d"]),
-                    "momentum_20": float(row["momentum_20"]),
-                    "momentum_60": float(row["momentum_60"]),
-                    "reversal_10": float(row["reversal_10"]),
-                    "volatility_10": float(row["volatility_10"]),
-                    "volatility_20": float(row["volatility_20"]),
-                    "volatility_60": float(row["volatility_60"]),
-                    "volume_ratio_5": float(row["volume_ratio_5"]),
-                    "volume_ratio_20": float(row["volume_ratio_20"]),
-                    "turnover_rate": float(row["turnover_rate"]),
-                    "turnover_ratio_5": float(row["turnover_ratio_5"]),
-                    "price_vs_ma_20": float(row["price_vs_ma_20"]),
-                    "price_vs_ma_60": float(row["price_vs_ma_60"]),
-                    "breakout_20": float(row["breakout_20"]),
-                    "close_position_20": float(row["close_position_20"]),
-                    "intraday_range": float(row["intraday_range"]),
-                    "atr_14": float(row["atr_14"]),
-                }
-            )
-
-    feature_frame = pd.DataFrame(feature_rows)
-    if feature_frame.empty:
-        raise RuntimeError("No aligned histories were available for backtest.")
-
-    def rank_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
-        ranked = snapshot.copy()
-        score_inputs = [
-            "return_5d",
-            "momentum_20",
-            "momentum_60",
-            "volatility_20",
-            "volume_ratio_5",
-            "turnover_ratio_5",
-            "close_position_20",
-        ]
-        ranked[score_inputs] = ranked[score_inputs].fillna(0.0)
-        ranked["momentum_rank"] = ranked["momentum_20"].rank(pct=True)
-        ranked["trend_rank"] = ranked["momentum_60"].rank(pct=True)
-        ranked["quality_rank"] = ranked["return_5d"].rank(pct=True)
-        ranked["liquidity_rank"] = ranked["volume_ratio_5"].rank(pct=True)
-        ranked["participation_rank"] = ranked["turnover_ratio_5"].rank(pct=True)
-        ranked["structure_rank"] = ranked["close_position_20"].rank(pct=True)
-        ranked["risk_rank"] = 1 - ranked["volatility_20"].rank(pct=True)
-        ranked["score"] = (
-            ranked["momentum_rank"] * 0.22
-            + ranked["trend_rank"] * 0.18
-            + ranked["quality_rank"] * 0.16
-            + ranked["liquidity_rank"] * 0.12
-            + ranked["participation_rank"] * 0.10
-            + ranked["structure_rank"] * 0.10
-            + ranked["risk_rank"] * 0.12
-        )
-        return ranked.sort_values("score", ascending=False).reset_index(drop=True)
-
-    rebalance_dates = common_dates[:: config.rebalance_days]
-    positions_by_date: dict = {}
-    previous_holdings: set[str] = set()
-    cost_rate = (config.trading_cost_bps + config.slippage_bps) / 10000
-    turnover_values: list[float] = []
-    total_cost = 0.0
-    rebalance_log: list[dict] = []
-
-    for rebalance_date in rebalance_dates:
-        snapshot = feature_frame[feature_frame["trade_date"] == rebalance_date].copy()
-        ranked = rank_snapshot(snapshot)
-        top_snapshot = ranked.head(config.top_n).copy()
-        holdings = set(top_snapshot["symbol"].tolist())
-        changed = previous_holdings.symmetric_difference(holdings)
-        turnover = len(changed) / max(config.top_n * 2, 1)
-        turnover_values.append(turnover)
-        total_cost += turnover * cost_rate
-        rebalance_log.append(
-            {
-                "trade_date": rebalance_date,
-                "turnover": float(turnover),
-                "estimated_cost": float(turnover * cost_rate),
-                "holdings": [
-                    {
-                        "symbol": row["symbol"],
-                        "name": row["name"],
-                        "score": float(row["score"]),
-                    }
-                    for _, row in top_snapshot.iterrows()
-                ],
-            }
-        )
-        previous_holdings = holdings
-
-        start_idx = date_index[rebalance_date]
-        end_idx = min(start_idx + config.rebalance_days, len(common_dates))
-        for idx in range(start_idx, end_idx):
-            positions_by_date[common_dates[idx]] = list(holdings)
-
-    portfolio_returns = []
-    benchmark_symbol = sorted(returns_by_symbol.keys())[0]
-    benchmark_returns = returns_by_symbol[benchmark_symbol].reindex(common_dates).fillna(0)
-
-    for trade_date in common_dates:
-        holdings = positions_by_date.get(trade_date, [])
-        day_returns = [returns_by_symbol[symbol].loc[trade_date] for symbol in holdings if symbol in returns_by_symbol]
-        gross_return = float(sum(day_returns) / len(day_returns)) if day_returns else 0.0
-        day_cost = 0.0
-        if trade_date in rebalance_dates:
-            rebalance_idx = rebalance_dates.index(trade_date)
-            day_cost = turnover_values[rebalance_idx] * cost_rate
-        portfolio_returns.append(gross_return - day_cost)
-
-    portfolio_ret = pd.Series(portfolio_returns, index=common_dates)
-    equity = (1 + portfolio_ret).cumprod()
-    benchmark = (1 + benchmark_returns).cumprod()
-
-    sharpe = 0.0
-    if portfolio_ret.std() > 0:
-        sharpe = float((portfolio_ret.mean() / portfolio_ret.std()) * math.sqrt(252))
-
-    annual_return = float((equity.iloc[-1] ** (252 / max(len(equity), 1))) - 1)
-    annual_volatility = _annualized_volatility(portfolio_ret)
-    max_drawdown = _max_drawdown(equity)
-    benchmark_return = float(benchmark.iloc[-1] - 1)
-    total_return = float(equity.iloc[-1] - 1)
-    sortino = _safe_sortino(annual_return, portfolio_ret)
-    information_ratio = _information_ratio(portfolio_ret, benchmark_returns)
-    beta, alpha = _compute_beta_alpha(portfolio_ret, benchmark_returns)
-    latest_snapshot = rank_snapshot(feature_frame[feature_frame["trade_date"] == common_dates[-1]].copy())
-    summary = {
-        "annual_return": annual_return,
-        "annual_volatility": annual_volatility,
-        "max_drawdown": max_drawdown,
-        "calmar": _safe_calmar(annual_return, max_drawdown),
-        "sharpe": sharpe,
-        "sortino": sortino,
-        "information_ratio": information_ratio,
-        "beta": beta,
-        "alpha": alpha,
-        "win_rate": float((portfolio_ret > 0).mean()),
-        "total_return": total_return,
-        "benchmark_return": benchmark_return,
-        "excess_return": float(total_return - benchmark_return),
-        "avg_turnover": float(sum(turnover_values) / len(turnover_values)) if turnover_values else 0.0,
-        "total_cost": float(total_cost),
-        "rebalance_days": config.rebalance_days,
-        "holdings_per_rebalance": config.top_n,
-    }
-
-    equity_curve = [
-        {
-            "trade_date": common_dates[i],
-            "equity": round(float(equity.iloc[i]), 4),
-            "benchmark": round(float(benchmark.iloc[i]), 4),
-        }
-        for i in range(len(equity))
-    ]
-
-    return {
-        "summary": summary,
-        "equity_curve": equity_curve,
-        "picks": latest_snapshot.head(config.top_n)[
-            [
-                "symbol",
-                "close",
-                "ret_1d",
-                "return_5d",
-                "return_10d",
-                "momentum_20",
-                "momentum_60",
-                "reversal_10",
-                "volatility_10",
-                "volatility_20",
-                "volatility_60",
-                "volume_ratio_5",
-                "volume_ratio_20",
-                "turnover_rate",
-                "turnover_ratio_5",
-                "price_vs_ma_20",
-                "price_vs_ma_60",
-                "breakout_20",
-                "close_position_20",
-                "intraday_range",
-                "atr_14",
-                "score",
-            ]
-        ].to_dict(orient="records"),
-        "rebalances": rebalance_log[-8:],
-    }
+    return _run_rule_based_backtest_from_histories(histories, names=names, config=config)
 
 
 def _expand_int_options(base: int, step: int, width: int, floor: int, ceil: int) -> list[int]:
@@ -446,7 +639,7 @@ def run_backtest_sensitivity_from_histories(
     top_n_options = _expand_int_options(config.top_n, step=1, width=width, floor=1, ceil=10)
     cost_options = _build_cost_options(config.trading_cost_bps, width=width)
 
-    baseline_result = run_baseline_backtest_from_histories(histories, names=names, config=config)
+    baseline_result = run_backtest_from_histories(histories, names=names, config=config)
     baseline_point = _summary_to_scan_point(baseline_result.get("summary", {}), config)
 
     rows: list[dict] = []
@@ -459,7 +652,7 @@ def run_backtest_sensitivity_from_histories(
                     trading_cost_bps=trading_cost_bps,
                     slippage_bps=config.slippage_bps,
                 )
-                result = run_baseline_backtest_from_histories(histories, names=names, config=scan_config)
+                result = run_backtest_from_histories(histories, names=names, config=scan_config)
                 rows.append(_summary_to_scan_point(result.get("summary", {}), scan_config))
 
     rows = sorted(
@@ -544,7 +737,7 @@ def run_backtest_stability_from_histories(
 ) -> dict:
     config = base_config or BacktestConfig()
     window = min(max(int(rolling_window), 10), 40)
-    result = run_baseline_backtest_from_histories(histories, names=names, config=config)
+    result = run_backtest_from_histories(histories, names=names, config=config)
     curve = pd.DataFrame(result.get("equity_curve", []))
     if curve.empty:
         return {
@@ -673,7 +866,7 @@ def run_backtest_monte_carlo_from_histories(
 ) -> dict:
     config = base_config or BacktestConfig()
     n_trials = min(max(int(trials), 50), 1000)
-    result = run_baseline_backtest_from_histories(histories, names=names, config=config)
+    result = run_backtest_from_histories(histories, names=names, config=config)
     curve = pd.DataFrame(result.get("equity_curve", []))
     if curve.empty or len(curve) < 20:
         return {
@@ -822,7 +1015,7 @@ def run_backtest_scenarios_from_histories(
 
     rows: list[dict] = []
     for entry in scenario_configs:
-        scenario_result = run_baseline_backtest_from_histories(histories, names=names, config=entry["config"])
+        scenario_result = run_backtest_from_histories(histories, names=names, config=entry["config"])
         summary = scenario_result.get("summary", {})
         rows.append(
             {

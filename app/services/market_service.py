@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 
@@ -12,6 +12,7 @@ from app.services.backtest import (
     TRADING_COST_BPS,
     BacktestConfig,
     run_baseline_backtest_from_histories,
+    run_backtest_from_histories,
     run_backtest_monte_carlo_from_histories,
     run_backtest_scenarios_from_histories,
     run_backtest_sensitivity_from_histories,
@@ -25,6 +26,7 @@ from app.services.data_provider import (
     get_provider,
 )
 from app.services.factor_engine import build_factor_table_from_histories
+from app.services.modeling import resolve_active_provider
 from app.services.storage import MarketRepository
 
 DEFAULT_SIGNAL_ACCOUNT_ID = "default"
@@ -47,13 +49,6 @@ class MarketService:
             UniverseItem(symbol=str(item["symbol"]).zfill(6), name=str(item["name"]))
             for item in self.repo.load_custom_universe()
         ]
-        if not custom_universe:
-            cached_universe = self.repo.load_universe(provider=self.settings.data_provider)
-            if not cached_universe.empty:
-                custom_universe = [
-                    UniverseItem(symbol=str(row["symbol"]).zfill(6), name=str(row["name"]))
-                    for _, row in cached_universe.iterrows()
-                ]
         try:
             self.provider = get_provider(custom_universe=custom_universe)
             self.provider_init_error = ""
@@ -281,6 +276,16 @@ class MarketService:
                     "market": str(profile.get("market", "") or ""),
                     "exchange": str(profile.get("exchange", "") or ""),
                     "list_date": str(profile.get("list_date", "") or ""),
+                    "fin_ann_date": str(profile.get("fin_ann_date", "") or ""),
+                    "fin_end_date": str(profile.get("fin_end_date", "") or ""),
+                    "roe_dt": float(profile["roe_dt"]) if pd.notna(profile.get("roe_dt")) else None,
+                    "grossprofit_margin": float(profile["grossprofit_margin"])
+                    if pd.notna(profile.get("grossprofit_margin"))
+                    else None,
+                    "debt_to_assets": float(profile["debt_to_assets"])
+                    if pd.notna(profile.get("debt_to_assets"))
+                    else None,
+                    "ocfps": float(profile["ocfps"]) if pd.notna(profile.get("ocfps")) else None,
                     "turnover_rate_f": float(latest["turnover_rate_f"]) if pd.notna(latest.get("turnover_rate_f")) else None,
                     "pe_ttm": float(latest["pe_ttm"]) if pd.notna(latest.get("pe_ttm")) else None,
                     "pb": float(latest["pb"]) if pd.notna(latest.get("pb")) else None,
@@ -343,7 +348,44 @@ class MarketService:
         current_positions = self.repo.load_paper_positions(account_id=DEFAULT_SIGNAL_ACCOUNT_ID)
         current_symbols = [str(item["symbol"]) for item in current_positions]
         relevant_symbols = sorted(set([*current_symbols, *[str(item["symbol"]) for item in predictions]]))
+        signal_trade_date: date | None = None
+        if predictions:
+            raw_trade_date = predictions[0].get("trade_date")
+            if isinstance(raw_trade_date, date):
+                signal_trade_date = raw_trade_date
+            elif raw_trade_date:
+                try:
+                    signal_trade_date = datetime.fromisoformat(str(raw_trade_date)).date()
+                except ValueError:
+                    signal_trade_date = None
         price_map = self.repo.load_latest_prices(relevant_symbols, provider=active_provider)
+        provider: BaseProvider | None = None
+        limit_map: dict[str, dict] = {}
+        suspension_map: dict[str, dict] = {}
+        if active_provider == self.settings.data_provider:
+            try:
+                provider = self._get_provider()
+            except Exception:
+                provider = None
+        if provider is not None and signal_trade_date is not None:
+            try:
+                limit_frame = provider.get_price_limits(relevant_symbols, trade_date=datetime.combine(signal_trade_date, datetime.min.time()))
+                if not limit_frame.empty and "symbol" in limit_frame.columns:
+                    limit_map = {
+                        str(row["symbol"]).zfill(6): row
+                        for _, row in limit_frame.iterrows()
+                    }
+            except Exception:
+                limit_map = {}
+            try:
+                suspension_frame = provider.get_suspensions(trade_date=datetime.combine(signal_trade_date, datetime.min.time()))
+                if not suspension_frame.empty and "symbol" in suspension_frame.columns:
+                    suspension_map = {
+                        str(row["symbol"]).zfill(6): row
+                        for _, row in suspension_frame.iterrows()
+                    }
+            except Exception:
+                suspension_map = {}
         latest_bar_map: dict[str, dict] = {}
         for symbol in relevant_symbols:
             bars = self.repo.load_symbol_history(symbol, limit=3, provider=active_provider)
@@ -363,6 +405,7 @@ class MarketService:
                 "pb": float(latest.get("pb", 0.0) or 0.0) if pd.notna(latest.get("pb")) else None,
                 "total_mv": float(latest.get("total_mv", 0.0) or 0.0) if pd.notna(latest.get("total_mv")) else None,
                 "circ_mv": float(latest.get("circ_mv", 0.0) or 0.0) if pd.notna(latest.get("circ_mv")) else None,
+                "trade_date": latest.get("trade_date"),
             }
         if price_map:
             self.repo.refresh_paper_position_prices(price_map, account_id=DEFAULT_SIGNAL_ACCOUNT_ID)
@@ -408,13 +451,21 @@ class MarketService:
             latest_price = float(price_map.get(symbol, 0.0) or 0.0)
             latest_change_pct = float(latest_bar.get("change_pct", 0.0) or 0.0)
             latest_turnover_rate = float(latest_bar.get("turnover_rate", 0.0) or 0.0)
+            limit_row = limit_map.get(symbol, {})
+            suspension_row = suspension_map.get(symbol, {})
+            up_limit = float(limit_row.get("up_limit", 0.0) or 0.0)
             upper_name = name.upper()
             if "ST" in upper_name or "退" in name:
                 return True, "存在 ST/退市风险"
+            if suspension_row:
+                suspend_type = str(suspension_row.get("suspend_type", "") or "停牌")
+                return True, f"当日停复牌状态：{suspend_type}"
             if latest_price <= 0:
                 return True, "缺少可靠最新价"
             if latest_volume <= 0 or latest_amount <= 0:
                 return True, "疑似停牌或当日无成交"
+            if up_limit > 0 and latest_price >= up_limit * 0.998:
+                return True, f"触及或接近涨停价 {up_limit:.2f}"
             if latest_change_pct >= 0.095:
                 return True, f"接近涨停 {latest_change_pct:.2%}"
             if latest_amount < min_liquidity_amount and latest_turnover_rate < min_turnover_rate:
@@ -562,6 +613,10 @@ class MarketService:
             latest_change_pct: float,
             latest_amount: float,
             latest_turnover_rate: float,
+            up_limit: float,
+            down_limit: float,
+            suspended: bool,
+            suspend_type: str,
         ) -> tuple[str, str, list[str], int]:
             flags: list[str] = []
             executable_quantity = max(abs(int(target_quantity) - int(current_quantity)), 0)
@@ -570,6 +625,14 @@ class MarketService:
                     "blocked",
                     "缺少可靠最新价，先刷新行情后再决定是否执行。",
                     ["缺少最新价格"],
+                    0,
+                )
+            if suspended:
+                flags.append(suspend_type or "停牌")
+                return (
+                    "blocked",
+                    "该股票处于停复牌状态，今天不建议执行。",
+                    flags,
                     0,
                 )
 
@@ -584,6 +647,14 @@ class MarketService:
                 executable_quantity = min(executable_quantity or current_quantity, max(sellable_quantity, 0))
                 if buy_locked_quantity > 0:
                     flags.append(f"T+1 锁定 {buy_locked_quantity} 股")
+                if down_limit > 0 and price <= down_limit * 1.002:
+                    flags.append(f"接近跌停价 {down_limit:.2f}")
+                    return (
+                        "blocked",
+                        "该股票已接近跌停价，卖出成交不确定，建议盘中确认是否可执行。",
+                        flags,
+                        executable_quantity,
+                    )
                 if latest_change_pct <= -0.095:
                     flags.append(f"接近跌停 {latest_change_pct:.2%}")
                     return (
@@ -628,6 +699,14 @@ class MarketService:
             if action in {"买入", "加仓"}:
                 if current_quantity == 0:
                     flags.append("新增开仓")
+                if up_limit > 0 and price >= up_limit * 0.998:
+                    flags.append(f"接近涨停价 {up_limit:.2f}")
+                    return (
+                        "blocked",
+                        "该股票已接近涨停价，买入成交不确定，建议暂时跳过或等盘中确认。",
+                        flags,
+                        executable_quantity,
+                    )
                 if latest_change_pct >= 0.095:
                     flags.append(f"接近涨停 {latest_change_pct:.2%}")
                     return (
@@ -712,6 +791,8 @@ class MarketService:
             current_weight = float(current_value / equity) if equity > 0 else 0.0
             target_quantity = build_target_quantity(price)
             delta_quantity = target_quantity - current_quantity
+            limit_row = limit_map.get(symbol, {})
+            suspension_row = suspension_map.get(symbol, {})
             action = "持有"
             note = "已在目标组合中，建议继续持有。"
             if current_quantity == 0 and target_quantity > 0:
@@ -734,6 +815,10 @@ class MarketService:
                 latest_change_pct=float(latest_bar.get("change_pct", 0.0) or 0.0),
                 latest_amount=float(latest_bar.get("amount", 0.0) or 0.0),
                 latest_turnover_rate=float(latest_bar.get("turnover_rate", 0.0) or 0.0),
+                up_limit=float(limit_row.get("up_limit", 0.0) or 0.0),
+                down_limit=float(limit_row.get("down_limit", 0.0) or 0.0),
+                suspended=bool(suspension_row),
+                suspend_type=str(suspension_row.get("suspend_type", "") or "停牌"),
             )
             target_row = {
                 "symbol": symbol,
@@ -812,6 +897,10 @@ class MarketService:
                 latest_change_pct=float(latest_bar.get("change_pct", 0.0) or 0.0),
                 latest_amount=float(latest_bar.get("amount", 0.0) or 0.0),
                 latest_turnover_rate=float(latest_bar.get("turnover_rate", 0.0) or 0.0),
+                up_limit=float(limit_map.get(symbol, {}).get("up_limit", 0.0) or 0.0),
+                down_limit=float(limit_map.get(symbol, {}).get("down_limit", 0.0) or 0.0),
+                suspended=bool(suspension_map.get(symbol)),
+                suspend_type=str(suspension_map.get(symbol, {}).get("suspend_type", "") or "停牌"),
             )
             suggestions.append(
                 {
@@ -1259,7 +1348,7 @@ class MarketService:
         )
 
     def get_factor_table(self) -> pd.DataFrame:
-        histories = self._load_histories(limit=90)
+        histories = self._load_histories(limit=180)
         names = self._load_names()
         return build_factor_table_from_histories(histories, names=names)
 
@@ -1268,6 +1357,34 @@ class MarketService:
         names = self._load_names()
         return histories, names
 
+    def _resolve_backtest_config(
+        self,
+        *,
+        rebalance_days: int | None = None,
+        top_n: int | None = None,
+        trading_cost_bps: float | None = None,
+        slippage_bps: float | None = None,
+        backtest_mode: str | None = None,
+    ) -> BacktestConfig:
+        normalized_mode = str(backtest_mode or "rule").strip().lower()
+        active_provider = resolve_active_provider(self.repo, self.settings.data_provider)
+        model_name: str | None = None
+        if normalized_mode == "model":
+            latest_model = self.repo.load_latest_model_run(provider=active_provider)
+            model_name = str(latest_model.get("model_name", "") or "") if latest_model else ""
+            if not model_name:
+                normalized_mode = "rule"
+                model_name = None
+
+        return BacktestConfig(
+            rebalance_days=rebalance_days or REBALANCE_DAYS,
+            top_n=top_n or TOP_N,
+            trading_cost_bps=trading_cost_bps if trading_cost_bps is not None else TRADING_COST_BPS,
+            slippage_bps=slippage_bps if slippage_bps is not None else SLIPPAGE_BPS,
+            backtest_mode=normalized_mode,
+            model_name=model_name,
+        )
+
     def get_backtest(
         self,
         *,
@@ -1275,16 +1392,18 @@ class MarketService:
         top_n: int | None = None,
         trading_cost_bps: float | None = None,
         slippage_bps: float | None = None,
+        backtest_mode: str | None = None,
     ) -> dict:
-        histories = self._load_histories(limit=90)
+        histories = self._load_histories(limit=180)
         names = self._load_names()
-        config = BacktestConfig(
-            rebalance_days=rebalance_days or REBALANCE_DAYS,
-            top_n=top_n or TOP_N,
-            trading_cost_bps=trading_cost_bps if trading_cost_bps is not None else TRADING_COST_BPS,
-            slippage_bps=slippage_bps if slippage_bps is not None else SLIPPAGE_BPS,
+        config = self._resolve_backtest_config(
+            rebalance_days=rebalance_days,
+            top_n=top_n,
+            trading_cost_bps=trading_cost_bps,
+            slippage_bps=slippage_bps,
+            backtest_mode=backtest_mode,
         )
-        return run_baseline_backtest_from_histories(histories, names=names, config=config)
+        return run_backtest_from_histories(histories, names=names, config=config)
 
     def get_backtest_sensitivity(
         self,
@@ -1294,14 +1413,16 @@ class MarketService:
         trading_cost_bps: float | None = None,
         slippage_bps: float | None = None,
         scan_width: int = 1,
+        backtest_mode: str | None = None,
     ) -> dict:
-        histories = self._load_histories(limit=120)
+        histories = self._load_histories(limit=180)
         names = self._load_names()
-        config = BacktestConfig(
-            rebalance_days=rebalance_days or REBALANCE_DAYS,
-            top_n=top_n or TOP_N,
-            trading_cost_bps=trading_cost_bps if trading_cost_bps is not None else TRADING_COST_BPS,
-            slippage_bps=slippage_bps if slippage_bps is not None else SLIPPAGE_BPS,
+        config = self._resolve_backtest_config(
+            rebalance_days=rebalance_days,
+            top_n=top_n,
+            trading_cost_bps=trading_cost_bps,
+            slippage_bps=slippage_bps,
+            backtest_mode=backtest_mode,
         )
         return run_backtest_sensitivity_from_histories(histories, names=names, base_config=config, scan_width=scan_width)
 
@@ -1313,14 +1434,16 @@ class MarketService:
         trading_cost_bps: float | None = None,
         slippage_bps: float | None = None,
         rolling_window: int = 20,
+        backtest_mode: str | None = None,
     ) -> dict:
-        histories = self._load_histories(limit=120)
+        histories = self._load_histories(limit=180)
         names = self._load_names()
-        config = BacktestConfig(
-            rebalance_days=rebalance_days or REBALANCE_DAYS,
-            top_n=top_n or TOP_N,
-            trading_cost_bps=trading_cost_bps if trading_cost_bps is not None else TRADING_COST_BPS,
-            slippage_bps=slippage_bps if slippage_bps is not None else SLIPPAGE_BPS,
+        config = self._resolve_backtest_config(
+            rebalance_days=rebalance_days,
+            top_n=top_n,
+            trading_cost_bps=trading_cost_bps,
+            slippage_bps=slippage_bps,
+            backtest_mode=backtest_mode,
         )
         return run_backtest_stability_from_histories(
             histories,
@@ -1337,14 +1460,16 @@ class MarketService:
         trading_cost_bps: float | None = None,
         slippage_bps: float | None = None,
         trials: int = 300,
+        backtest_mode: str | None = None,
     ) -> dict:
-        histories = self._load_histories(limit=120)
+        histories = self._load_histories(limit=180)
         names = self._load_names()
-        config = BacktestConfig(
-            rebalance_days=rebalance_days or REBALANCE_DAYS,
-            top_n=top_n or TOP_N,
-            trading_cost_bps=trading_cost_bps if trading_cost_bps is not None else TRADING_COST_BPS,
-            slippage_bps=slippage_bps if slippage_bps is not None else SLIPPAGE_BPS,
+        config = self._resolve_backtest_config(
+            rebalance_days=rebalance_days,
+            top_n=top_n,
+            trading_cost_bps=trading_cost_bps,
+            slippage_bps=slippage_bps,
+            backtest_mode=backtest_mode,
         )
         return run_backtest_monte_carlo_from_histories(
             histories,
@@ -1360,14 +1485,16 @@ class MarketService:
         top_n: int | None = None,
         trading_cost_bps: float | None = None,
         slippage_bps: float | None = None,
+        backtest_mode: str | None = None,
     ) -> dict:
-        histories = self._load_histories(limit=120)
+        histories = self._load_histories(limit=180)
         names = self._load_names()
-        config = BacktestConfig(
-            rebalance_days=rebalance_days or REBALANCE_DAYS,
-            top_n=top_n or TOP_N,
-            trading_cost_bps=trading_cost_bps if trading_cost_bps is not None else TRADING_COST_BPS,
-            slippage_bps=slippage_bps if slippage_bps is not None else SLIPPAGE_BPS,
+        config = self._resolve_backtest_config(
+            rebalance_days=rebalance_days,
+            top_n=top_n,
+            trading_cost_bps=trading_cost_bps,
+            slippage_bps=slippage_bps,
+            backtest_mode=backtest_mode,
         )
         return run_backtest_scenarios_from_histories(
             histories,

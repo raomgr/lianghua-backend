@@ -15,7 +15,7 @@ def main() -> None:
     )
     print(
         f"synced symbols={sync['symbols_synced']} bars={sync['bars_written']} "
-        f"db={settings.database_url}"
+        f"db={settings.database_path}"
     )
     if service.last_sync_warning:
         print(f"warning={service.last_sync_warning}")

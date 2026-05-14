@@ -133,6 +133,7 @@ def backtest(
     top_n: int = Query(3, ge=1, le=10),
     trading_cost_bps: float = Query(8.0, ge=0, le=100),
     slippage_bps: float = Query(5.0, ge=0, le=100),
+    backtest_mode: str = Query("rule", pattern="^(rule|model)$"),
 ) -> BacktestResponse:
     return BacktestResponse(
         **market.get_backtest(
@@ -140,6 +141,7 @@ def backtest(
             top_n=top_n,
             trading_cost_bps=trading_cost_bps,
             slippage_bps=slippage_bps,
+            backtest_mode=backtest_mode,
         )
     )
 
@@ -151,6 +153,7 @@ def backtest_sensitivity(
     trading_cost_bps: float = Query(8.0, ge=0, le=100),
     slippage_bps: float = Query(5.0, ge=0, le=100),
     scan_width: int = Query(1, ge=1, le=3),
+    backtest_mode: str = Query("rule", pattern="^(rule|model)$"),
 ) -> BacktestSensitivityResponse:
     return BacktestSensitivityResponse(
         **market.get_backtest_sensitivity(
@@ -159,6 +162,7 @@ def backtest_sensitivity(
             trading_cost_bps=trading_cost_bps,
             slippage_bps=slippage_bps,
             scan_width=scan_width,
+            backtest_mode=backtest_mode,
         )
     )
 
@@ -170,6 +174,7 @@ def backtest_stability(
     trading_cost_bps: float = Query(8.0, ge=0, le=100),
     slippage_bps: float = Query(5.0, ge=0, le=100),
     rolling_window: int = Query(20, ge=10, le=40),
+    backtest_mode: str = Query("rule", pattern="^(rule|model)$"),
 ) -> BacktestStabilityResponse:
     return BacktestStabilityResponse(
         **market.get_backtest_stability(
@@ -178,6 +183,7 @@ def backtest_stability(
             trading_cost_bps=trading_cost_bps,
             slippage_bps=slippage_bps,
             rolling_window=rolling_window,
+            backtest_mode=backtest_mode,
         )
     )
 
@@ -189,6 +195,7 @@ def backtest_monte_carlo(
     trading_cost_bps: float = Query(8.0, ge=0, le=100),
     slippage_bps: float = Query(5.0, ge=0, le=100),
     trials: int = Query(300, ge=50, le=1000),
+    backtest_mode: str = Query("rule", pattern="^(rule|model)$"),
 ) -> BacktestMonteCarloResponse:
     return BacktestMonteCarloResponse(
         **market.get_backtest_monte_carlo(
@@ -197,6 +204,7 @@ def backtest_monte_carlo(
             trading_cost_bps=trading_cost_bps,
             slippage_bps=slippage_bps,
             trials=trials,
+            backtest_mode=backtest_mode,
         )
     )
 
@@ -207,6 +215,7 @@ def backtest_scenarios(
     top_n: int = Query(3, ge=1, le=10),
     trading_cost_bps: float = Query(8.0, ge=0, le=100),
     slippage_bps: float = Query(5.0, ge=0, le=100),
+    backtest_mode: str = Query("rule", pattern="^(rule|model)$"),
 ) -> BacktestScenarioResponse:
     return BacktestScenarioResponse(
         **market.get_backtest_scenarios(
@@ -214,6 +223,7 @@ def backtest_scenarios(
             top_n=top_n,
             trading_cost_bps=trading_cost_bps,
             slippage_bps=slippage_bps,
+            backtest_mode=backtest_mode,
         )
     )
 
@@ -349,7 +359,7 @@ def set_custom_universe(payload: CustomUniverseRequest) -> CustomUniverseRespons
     message = (
         "已恢复默认股票池。"
         if not items
-        else f"已保存 {len(items)} 只自定义股票，下一次同步将使用这批代码。"
+        else f"已保存 {len(items)} 只自定义关注股票，下一次同步会在默认股票池基础上附加这批代码。"
     )
     return CustomUniverseResponse(
         status="success",

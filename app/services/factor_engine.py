@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from app.services.data_provider import BaseProvider
@@ -24,15 +25,43 @@ FEATURE_COLUMNS = [
     "close_position_20",
     "intraday_range",
     "atr_14",
+    "turnover_rate_f",
+    "turnover_free_ratio_5",
+    "pe_ttm_inv",
+    "pb_inv",
+    "log_total_mv",
+    "log_circ_mv",
 ]
 
 
+def _apply_price_basis(frame: pd.DataFrame) -> pd.DataFrame:
+    price_frame = frame.copy()
+    for raw_col, qfq_col in [
+        ("open", "qfq_open"),
+        ("high", "qfq_high"),
+        ("low", "qfq_low"),
+        ("close", "qfq_close"),
+    ]:
+        if qfq_col in price_frame.columns:
+            adjusted = pd.to_numeric(price_frame[qfq_col], errors="coerce")
+            price_frame[raw_col] = adjusted.fillna(price_frame[raw_col])
+    return price_frame
+
+
 def enrich_bars(bars: pd.DataFrame) -> pd.DataFrame:
-    frame = bars.copy()
+    frame = _apply_price_basis(bars)
     if "amount" not in frame.columns:
         frame["amount"] = frame["close"] * frame["volume"]
     if "turnover_rate" not in frame.columns:
         frame["turnover_rate"] = 0.0
+    if "turnover_rate_f" not in frame.columns:
+        frame["turnover_rate_f"] = frame["turnover_rate"]
+    else:
+        frame["turnover_rate_f"] = pd.to_numeric(frame["turnover_rate_f"], errors="coerce").fillna(frame["turnover_rate"])
+    for column in ["pe_ttm", "pb", "total_mv", "circ_mv"]:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame["ret_1d"] = frame["close"].pct_change()
     frame["return_5d"] = frame["close"].pct_change(5)
     frame["return_10d"] = frame["close"].pct_change(10)
@@ -48,6 +77,8 @@ def enrich_bars(bars: pd.DataFrame) -> pd.DataFrame:
     frame["volume_ratio_20"] = (frame["volume"] / frame["volume_ma_20"]).fillna(1)
     frame["turnover_ma_5"] = frame["turnover_rate"].rolling(5).mean()
     frame["turnover_ratio_5"] = (frame["turnover_rate"] / frame["turnover_ma_5"]).replace([pd.NA, pd.NaT], 0).fillna(1)
+    frame["turnover_f_ma_5"] = frame["turnover_rate_f"].rolling(5).mean()
+    frame["turnover_free_ratio_5"] = (frame["turnover_rate_f"] / frame["turnover_f_ma_5"]).replace([pd.NA, pd.NaT], 0).fillna(1)
     frame["ma_20"] = frame["close"].rolling(20).mean()
     frame["ma_60"] = frame["close"].rolling(60).mean()
     frame["price_vs_ma_20"] = (frame["close"] / frame["ma_20"] - 1).fillna(0)
@@ -68,6 +99,14 @@ def enrich_bars(bars: pd.DataFrame) -> pd.DataFrame:
     )
     frame["atr_14"] = tr_components.max(axis=1).rolling(14).mean().fillna(0) / frame["close"]
     frame["intraday_range"] = ((frame["high"] - frame["low"]) / frame["close"]).fillna(0)
+    positive_pe = frame["pe_ttm"].where(frame["pe_ttm"] > 0)
+    positive_pb = frame["pb"].where(frame["pb"] > 0)
+    positive_total_mv = frame["total_mv"].where(frame["total_mv"] > 0)
+    positive_circ_mv = frame["circ_mv"].where(frame["circ_mv"] > 0)
+    frame["pe_ttm_inv"] = (1 / positive_pe).fillna(0)
+    frame["pb_inv"] = (1 / positive_pb).fillna(0)
+    frame["log_total_mv"] = np.log(positive_total_mv).fillna(0)
+    frame["log_circ_mv"] = np.log(positive_circ_mv).fillna(0)
     return frame
 
 
@@ -100,6 +139,12 @@ def build_factor_table(provider: BaseProvider) -> pd.DataFrame:
                 "close_position_20": float(latest["close_position_20"]),
                 "intraday_range": float(latest["intraday_range"]),
                 "atr_14": float(latest["atr_14"]),
+                "turnover_rate_f": float(latest["turnover_rate_f"]),
+                "turnover_free_ratio_5": float(latest["turnover_free_ratio_5"]),
+                "pe_ttm_inv": float(latest["pe_ttm_inv"]),
+                "pb_inv": float(latest["pb_inv"]),
+                "log_total_mv": float(latest["log_total_mv"]),
+                "log_circ_mv": float(latest["log_circ_mv"]),
             }
         )
 
@@ -131,6 +176,12 @@ def build_factor_table_from_histories(histories: dict[str, pd.DataFrame], names:
         "close_position_20",
         "intraday_range",
         "atr_14",
+        "turnover_rate_f",
+        "turnover_free_ratio_5",
+        "pe_ttm_inv",
+        "pb_inv",
+        "log_total_mv",
+        "log_circ_mv",
         "score",
     ]
     rows = []
@@ -164,6 +215,12 @@ def build_factor_table_from_histories(histories: dict[str, pd.DataFrame], names:
                 "close_position_20": float(latest["close_position_20"]),
                 "intraday_range": float(latest["intraday_range"]),
                 "atr_14": float(latest["atr_14"]),
+                "turnover_rate_f": float(latest["turnover_rate_f"]),
+                "turnover_free_ratio_5": float(latest["turnover_free_ratio_5"]),
+                "pe_ttm_inv": float(latest["pe_ttm_inv"]),
+                "pb_inv": float(latest["pb_inv"]),
+                "log_total_mv": float(latest["log_total_mv"]),
+                "log_circ_mv": float(latest["log_circ_mv"]),
                 "score": 0.0,
             }
         )
@@ -210,15 +267,24 @@ def score_factors(frame: pd.DataFrame) -> pd.DataFrame:
     scored["quality_rank"] = scored["return_5d"].rank(pct=True)
     scored["liquidity_rank"] = scored["volume_ratio_5"].rank(pct=True)
     scored["participation_rank"] = scored["turnover_ratio_5"].rank(pct=True)
+    scored["free_participation_rank"] = scored["turnover_free_ratio_5"].rank(pct=True)
     scored["structure_rank"] = scored["close_position_20"].rank(pct=True)
     scored["risk_rank"] = 1 - scored["volatility_20"].rank(pct=True)
+    scored["value_rank"] = (
+        scored["pe_ttm_inv"].rank(pct=True) * 0.55
+        + scored["pb_inv"].rank(pct=True) * 0.45
+    )
+    scored["size_rank"] = 1 - scored["log_total_mv"].rank(pct=True)
     scored["score"] = (
-        scored["momentum_rank"] * 0.22
-        + scored["trend_rank"] * 0.18
-        + scored["quality_rank"] * 0.16
-        + scored["liquidity_rank"] * 0.12
-        + scored["participation_rank"] * 0.10
-        + scored["structure_rank"] * 0.10
-        + scored["risk_rank"] * 0.12
+        scored["momentum_rank"] * 0.19
+        + scored["trend_rank"] * 0.16
+        + scored["quality_rank"] * 0.14
+        + scored["liquidity_rank"] * 0.10
+        + scored["participation_rank"] * 0.08
+        + scored["free_participation_rank"] * 0.07
+        + scored["structure_rank"] * 0.08
+        + scored["risk_rank"] * 0.10
+        + scored["value_rank"] * 0.05
+        + scored["size_rank"] * 0.03
     )
     return scored.sort_values("score", ascending=False).reset_index(drop=True)

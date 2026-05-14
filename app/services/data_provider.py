@@ -48,6 +48,22 @@ def _load_catalog() -> list[UniverseItem]:
 
 COMMON_A_SHARE_CATALOG = _load_catalog()
 _TUSHARE_STOCK_BASIC_CACHE: dict[str, object] = {"loaded_at": 0.0, "frame": pd.DataFrame()}
+_TUSHARE_STK_LIMIT_CACHE: dict[str, pd.DataFrame] = {}
+_TUSHARE_SUSPEND_CACHE: dict[str, pd.DataFrame] = {}
+
+
+def _merge_universe_items(base_items: list[UniverseItem], extra_items: list[UniverseItem] | None = None) -> list[UniverseItem]:
+    merged: list[UniverseItem] = []
+    seen: set[str] = set()
+
+    for item in [*(base_items or []), *(extra_items or [])]:
+        symbol = str(item.symbol).zfill(6)
+        if symbol in seen:
+            continue
+        merged.append(UniverseItem(symbol=symbol, name=str(item.name)))
+        seen.add(symbol)
+
+    return merged
 
 
 class BaseProvider:
@@ -87,6 +103,40 @@ class BaseProvider:
             columns=["trade_date", "turnover_rate_f", "pe_ttm", "pb", "total_mv", "circ_mv"]
         )
 
+    def get_price_limits(self, symbols: list[str], trade_date: datetime | None = None) -> pd.DataFrame:
+        return pd.DataFrame(columns=["symbol", "trade_date", "up_limit", "down_limit", "pre_close"])
+
+    def get_suspensions(self, trade_date: datetime | None = None) -> pd.DataFrame:
+        return pd.DataFrame(columns=["symbol", "trade_date", "suspend_type", "suspend_timing"])
+
+    def get_adj_factors(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        return pd.DataFrame(columns=["trade_date", "adj_factor"])
+
+    def get_moneyflow(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "trade_date",
+                "buy_lg_amount",
+                "sell_lg_amount",
+                "buy_elg_amount",
+                "sell_elg_amount",
+                "net_mf_amount",
+            ]
+        )
+
+    def get_financial_indicators(self, symbols: list[str] | None = None) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "fin_ann_date",
+                "fin_end_date",
+                "roe_dt",
+                "grossprofit_margin",
+                "debt_to_assets",
+                "ocfps",
+            ]
+        )
+
 
 def _symbol_to_ts_code(symbol: str) -> str:
     clean = str(symbol).strip().upper()
@@ -124,13 +174,14 @@ def get_common_universe_catalog() -> list[UniverseItem]:
 
 class MockAShareProvider(BaseProvider):
     def __init__(self, custom_universe: list[UniverseItem] | None = None) -> None:
-        self._universe = custom_universe or [
+        base_universe = [
             UniverseItem(symbol="600519", name="贵州茅台"),
             UniverseItem(symbol="000001", name="平安银行"),
             UniverseItem(symbol="300750", name="宁德时代"),
             UniverseItem(symbol="601318", name="中国平安"),
             UniverseItem(symbol="600036", name="招商银行"),
         ]
+        self._universe = _merge_universe_items(base_universe, custom_universe)
 
     def get_universe(self) -> list[UniverseItem]:
         return self._universe
@@ -222,14 +273,14 @@ class AkshareProvider(BaseProvider):
         ]
 
     def get_universe(self) -> list[UniverseItem]:
-        if self.custom_universe:
-            return self.custom_universe[: self.settings.universe_limit]
         if self.settings.universe_source.lower() == "index":
             try:
-                return self._get_index_universe()
+                base_universe = self._get_index_universe()
             except Exception:
-                return self._get_spot_universe()
-        return self._get_spot_universe()
+                base_universe = self._get_spot_universe()
+        else:
+            base_universe = self._get_spot_universe()
+        return _merge_universe_items(base_universe, self.custom_universe)
 
     def get_daily_bars(self, symbol: str, limit: int = 120) -> pd.DataFrame:
         end = datetime.today()
@@ -279,14 +330,12 @@ class TushareProvider(BaseProvider):
         return self
 
     def _get_basic_universe(self) -> list[UniverseItem]:
-        if self.custom_universe:
-            return self.custom_universe[: self.settings.universe_limit]
         # Keep a low-permission compatible default universe so Tushare users can
         # still sync/train before building a custom pool in the UI.
         return get_common_universe_catalog()[: self.settings.universe_limit]
 
     def get_universe(self) -> list[UniverseItem]:
-        return self._get_basic_universe()
+        return _merge_universe_items(self._get_basic_universe(), self.custom_universe)
 
     def _load_stock_basic_frame(self) -> pd.DataFrame:
         loaded_at = float(_TUSHARE_STOCK_BASIC_CACHE.get("loaded_at", 0.0) or 0.0)
@@ -425,6 +474,180 @@ class TushareProvider(BaseProvider):
         return renamed[
             ["trade_date", "turnover_rate_f", "pe_ttm", "pb", "total_mv", "circ_mv"]
         ].sort_values("trade_date")
+
+    def get_price_limits(self, symbols: list[str], trade_date: datetime | None = None) -> pd.DataFrame:
+        if not symbols or trade_date is None:
+            return pd.DataFrame(columns=["symbol", "trade_date", "up_limit", "down_limit", "pre_close"])
+
+        trade_date_text = trade_date.strftime("%Y%m%d")
+        cached = _TUSHARE_STK_LIMIT_CACHE.get(trade_date_text)
+        if cached is None:
+            frame = self.pro.stk_limit(
+                trade_date=trade_date_text,
+                fields="ts_code,trade_date,pre_close,up_limit,down_limit",
+            )
+            if frame is None or frame.empty:
+                cached = pd.DataFrame(columns=["symbol", "trade_date", "up_limit", "down_limit", "pre_close"])
+            else:
+                cached = frame.rename(columns={"ts_code": "symbol"}).copy()
+                cached["symbol"] = (
+                    cached["symbol"].astype(str).str.split(".").str[0].str.zfill(6)
+                )
+                cached["trade_date"] = pd.to_datetime(
+                    cached["trade_date"], format="%Y%m%d", errors="coerce"
+                ).dt.date
+                for column in ["pre_close", "up_limit", "down_limit"]:
+                    cached[column] = pd.to_numeric(cached[column], errors="coerce")
+                cached = cached[["symbol", "trade_date", "up_limit", "down_limit", "pre_close"]]
+            _TUSHARE_STK_LIMIT_CACHE[trade_date_text] = cached
+
+        symbol_set = {str(symbol).zfill(6) for symbol in symbols}
+        return cached[cached["symbol"].isin(symbol_set)].copy()
+
+    def get_suspensions(self, trade_date: datetime | None = None) -> pd.DataFrame:
+        if trade_date is None:
+            return pd.DataFrame(columns=["symbol", "trade_date", "suspend_type", "suspend_timing"])
+
+        trade_date_text = trade_date.strftime("%Y%m%d")
+        cached = _TUSHARE_SUSPEND_CACHE.get(trade_date_text)
+        if cached is None:
+            frame = self.pro.suspend_d(
+                trade_date=trade_date_text,
+                fields="ts_code,trade_date,suspend_timing,suspend_type",
+            )
+            if frame is None or frame.empty:
+                cached = pd.DataFrame(columns=["symbol", "trade_date", "suspend_type", "suspend_timing"])
+            else:
+                cached = frame.rename(columns={"ts_code": "symbol"}).copy()
+                cached["symbol"] = (
+                    cached["symbol"].astype(str).str.split(".").str[0].str.zfill(6)
+                )
+                cached["trade_date"] = pd.to_datetime(
+                    cached["trade_date"], format="%Y%m%d", errors="coerce"
+                ).dt.date
+                for column in ["suspend_type", "suspend_timing"]:
+                    if column not in cached.columns:
+                        cached[column] = ""
+                    cached[column] = cached[column].fillna("").astype(str).str.strip()
+                cached = cached[["symbol", "trade_date", "suspend_type", "suspend_timing"]]
+            _TUSHARE_SUSPEND_CACHE[trade_date_text] = cached
+
+        return cached.copy()
+
+    def get_adj_factors(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        ts_code = _symbol_to_ts_code(symbol)
+        frame = self.pro.adj_factor(
+            ts_code=ts_code,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+        if frame is None or frame.empty:
+            return pd.DataFrame(columns=["trade_date", "adj_factor"])
+
+        renamed = frame.rename(columns=str).copy()
+        renamed["trade_date"] = pd.to_datetime(renamed["trade_date"], format="%Y%m%d").dt.date
+        renamed["adj_factor"] = pd.to_numeric(renamed["adj_factor"], errors="coerce")
+        return renamed[["trade_date", "adj_factor"]].sort_values("trade_date")
+
+    def get_moneyflow(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        ts_code = _symbol_to_ts_code(symbol)
+        frame = self.pro.moneyflow(
+            ts_code=ts_code,
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            fields="trade_date,buy_lg_amount,sell_lg_amount,buy_elg_amount,sell_elg_amount,net_mf_amount",
+        )
+        if frame is None or frame.empty:
+            return pd.DataFrame(
+                columns=[
+                    "trade_date",
+                    "buy_lg_amount",
+                    "sell_lg_amount",
+                    "buy_elg_amount",
+                    "sell_elg_amount",
+                    "net_mf_amount",
+                ]
+            )
+
+        renamed = frame.rename(columns=str).copy()
+        renamed["trade_date"] = pd.to_datetime(renamed["trade_date"], format="%Y%m%d").dt.date
+        for column in [
+            "buy_lg_amount",
+            "sell_lg_amount",
+            "buy_elg_amount",
+            "sell_elg_amount",
+            "net_mf_amount",
+        ]:
+            if column not in renamed.columns:
+                renamed[column] = np.nan
+            renamed[column] = pd.to_numeric(renamed[column], errors="coerce").fillna(0.0) * 10_000.0
+        return renamed[
+            [
+                "trade_date",
+                "buy_lg_amount",
+                "sell_lg_amount",
+                "buy_elg_amount",
+                "sell_elg_amount",
+                "net_mf_amount",
+            ]
+        ].sort_values("trade_date")
+
+    def get_financial_indicators(self, symbols: list[str] | None = None) -> pd.DataFrame:
+        symbol_list = [str(symbol).zfill(6) for symbol in symbols or []]
+        if not symbol_list:
+            symbol_list = [item.symbol for item in self.get_universe()]
+
+        rows: list[dict[str, object]] = []
+        for symbol in symbol_list:
+            ts_code = _symbol_to_ts_code(symbol)
+            frame = self.pro.fina_indicator(
+                ts_code=ts_code,
+                fields="ts_code,ann_date,end_date,roe_dt,grossprofit_margin,debt_to_assets,ocfps",
+            )
+            if frame is None or frame.empty:
+                continue
+
+            renamed = frame.rename(columns=str).copy()
+            for column in ["ann_date", "end_date"]:
+                if column not in renamed.columns:
+                    renamed[column] = ""
+                renamed[column] = renamed[column].fillna("").astype(str).str.strip()
+            for column in ["roe_dt", "grossprofit_margin", "debt_to_assets", "ocfps"]:
+                if column not in renamed.columns:
+                    renamed[column] = np.nan
+                renamed[column] = pd.to_numeric(renamed[column], errors="coerce")
+
+            renamed = renamed.sort_values(["ann_date", "end_date"], ascending=False, na_position="last")
+            latest = renamed.iloc[0]
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "fin_ann_date": str(latest.get("ann_date", "") or ""),
+                    "fin_end_date": str(latest.get("end_date", "") or ""),
+                    "roe_dt": float(latest["roe_dt"]) if pd.notna(latest.get("roe_dt")) else None,
+                    "grossprofit_margin": float(latest["grossprofit_margin"])
+                    if pd.notna(latest.get("grossprofit_margin"))
+                    else None,
+                    "debt_to_assets": float(latest["debt_to_assets"])
+                    if pd.notna(latest.get("debt_to_assets"))
+                    else None,
+                    "ocfps": float(latest["ocfps"]) if pd.notna(latest.get("ocfps")) else None,
+                }
+            )
+
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "symbol",
+                    "fin_ann_date",
+                    "fin_end_date",
+                    "roe_dt",
+                    "grossprofit_margin",
+                    "debt_to_assets",
+                    "ocfps",
+                ]
+            )
+        return pd.DataFrame(rows)
 
 
 def get_provider(custom_universe: list[UniverseItem] | None = None) -> BaseProvider:
